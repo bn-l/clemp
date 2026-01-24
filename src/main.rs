@@ -123,15 +123,17 @@ fn clone_repo(repo_url: &str) -> Result<()> {
 
 fn update_gitignore() -> Result<()> {
     let gitignore_path = Path::new(".gitignore");
-    if !gitignore_path.exists() {
-        return Ok(());
-    }
 
     let additions_path = Path::new(CLONE_DIR).join("gitignore-additions");
     let additions = fs::read_to_string(&additions_path)
         .with_context(|| format!("Failed to read {}", additions_path.display()))?;
 
-    let existing = fs::read_to_string(gitignore_path)?;
+    let existing = if gitignore_path.exists() {
+        fs::read_to_string(gitignore_path)?
+    } else {
+        String::new()
+    };
+
     let existing_lines: HashSet<&str> = existing.lines().map(str::trim).collect();
 
     let new_entries: Vec<&str> = additions
