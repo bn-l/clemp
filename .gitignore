@@ -1,0 +1,14 @@
+**/.env
+src.md
+**/CLAUDE.md
+**/.claude
+**/AGENTS.md
+**/.agent/
+REPOMAP.md
+CODEGUIDE.md
+**/.cursor
+.mcp.json
+
+# Added by cargo
+
+/target
