@@ -72,8 +72,12 @@ fn get_repo_url() -> Result<String> {
 }
 
 #[derive(Parser)]
-#[command(version, about = "Clone and configure claude-template for your project")]
+#[command(version, about = "Clone and configure claude-template for your project", disable_version_flag = true)]
 struct Cli {
+    /// Print version
+    #[arg(short = 'v', short_alias = 'V', long = "version", action = clap::ArgAction::Version)]
+    version: (),
+
     /// Language(s) for rules (e.g., ts, typescript, py, python, swift)
     #[arg(value_name = "LANGUAGE")]
     languages: Vec<String>,
