@@ -6,14 +6,14 @@ A CLI tool for scaffolding [Claude Code](https://docs.anthropic.com/en/docs/clau
 
 ## Installation
 
-Clone this then:
+With homebrew:
 ```bash
-cargo install --path .
+brew install bn-l/clemp/clemp
 ```
 
-Or with homebrew:
+Or cargo: clone this then:
 ```bash
-<update with homebrew command>
+cargo install --path .
 ```
 
 ## Usage
