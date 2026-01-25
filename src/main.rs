@@ -180,23 +180,21 @@ fn resolve_language(input: &str, rules_dir: &Path, template_content: &str) -> Re
         .unwrap_or_else(|| input.to_lowercase());
 
     let rules_file = rules_dir.join(format!("{}-rules.md", canonical));
-    let has_rules = rules_file.exists();
-    let has_conditional = template_has_conditional(template_content, &canonical);
 
-    match (has_rules, has_conditional) {
-        (true, _) => Ok(LanguageResolution::HasRulesFile(canonical)),
-        (false, true) => {
-            eprintln!(
-                "Warning: No rules file for '{}', but template has conditional sections for it",
-                canonical
-            );
-            Ok(LanguageResolution::ConditionalOnly(canonical))
-        }
-        (false, false) => bail!(
+    if rules_file.exists() {
+        Ok(LanguageResolution::HasRulesFile(canonical))
+    } else if template_has_conditional(template_content, &canonical) {
+        eprintln!(
+            "Warning: No rules file for '{}', but template has conditional sections for it",
+            canonical
+        );
+        Ok(LanguageResolution::ConditionalOnly(canonical))
+    } else {
+        bail!(
             "Language '{}' has no rules file ({}-rules.md) and no conditional sections in template",
             input,
             canonical
-        ),
+        )
     }
 }
 
