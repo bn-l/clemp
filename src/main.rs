@@ -176,9 +176,10 @@ fn template_has_conditional(template_content: &str, lang: &str) -> bool {
 enum LanguageResolution {
     HasRulesFile(String),      // canonical name, has rules file
     ConditionalOnly(String),   // canonical name, only has conditional in template
+    NoMatch,                   // no rules file or conditional - skip with warning
 }
 
-fn resolve_language(input: &str, rules_dir: &Path, template_content: &str) -> Result<LanguageResolution> {
+fn resolve_language(input: &str, rules_dir: &Path, template_content: &str) -> LanguageResolution {
     let canonical = normalize_language(input)
         .map(String::from)
         .unwrap_or_else(|| input.to_lowercase());
@@ -186,19 +187,20 @@ fn resolve_language(input: &str, rules_dir: &Path, template_content: &str) -> Re
     let rules_file = rules_dir.join(format!("{}-rules.md", canonical));
 
     if rules_file.exists() {
-        Ok(LanguageResolution::HasRulesFile(canonical))
+        LanguageResolution::HasRulesFile(canonical)
     } else if template_has_conditional(template_content, &canonical) {
         eprintln!(
             "Warning: No rules file for '{}', but template has conditional sections for it",
             canonical
         );
-        Ok(LanguageResolution::ConditionalOnly(canonical))
+        LanguageResolution::ConditionalOnly(canonical)
     } else {
-        bail!(
-            "Language '{}' has no rules file ({}-rules.md) and no conditional sections in template",
+        eprintln!(
+            "Warning: Language '{}' has no rules file ({}-rules.md) and no conditional sections in template, skipping",
             input,
             canonical
-        )
+        );
+        LanguageResolution::NoMatch
     }
 }
 
@@ -231,13 +233,16 @@ fn render_claude_md(languages: &[String], rules_dir: &Path) -> Result<String> {
     let mut languages_with_rules = Vec::new();
 
     for lang in languages {
-        match resolve_language(lang, rules_dir, &template_content)? {
+        match resolve_language(lang, rules_dir, &template_content) {
             LanguageResolution::HasRulesFile(canonical) => {
                 all_languages.push(canonical.clone());
                 languages_with_rules.push(canonical);
             }
             LanguageResolution::ConditionalOnly(canonical) => {
                 all_languages.push(canonical);
+            }
+            LanguageResolution::NoMatch => {
+                // Skip - warning already printed
             }
         }
     }
@@ -416,6 +421,32 @@ fn cleanup(clone_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn run_setup(cli: &Cli, clone_dir: &Path, rules_dir: &Path) -> Result<()> {
+    // Update .gitignore
+    println!("Updating .gitignore...");
+    update_gitignore()?;
+
+    // Render CLAUDE.md
+    println!("Rendering CLAUDE.md...");
+    let claude_md = render_claude_md(&cli.languages, rules_dir)?;
+    let claude_path = clone_dir.join("CLAUDE.md");
+    fs::write(&claude_path, claude_md)?;
+
+    // Update settings with hooks
+    println!("Configuring hooks: {:?}", cli.hooks);
+    update_settings_with_hooks(&cli.hooks, clone_dir)?;
+
+    // Filter .mcp.json
+    println!("Configuring MCP servers: {:?}", cli.mcp);
+    filter_mcp_json(&cli.mcp, clone_dir)?;
+
+    // Copy files to working directory
+    println!("Copying files...");
+    copy_files(clone_dir)?;
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let clone_dir = Path::new(CLONE_DIR);
@@ -428,29 +459,14 @@ fn main() -> Result<()> {
     println!("Cloning {}...", repo_url);
     clone_repo(&repo_url)?;
 
-    // 3. Update .gitignore
-    println!("Updating .gitignore...");
-    update_gitignore()?;
+    // 3-7. Run setup steps (with cleanup on error)
+    if let Err(e) = run_setup(&cli, clone_dir, &rules_dir) {
+        eprintln!("Removing {} due to error...", clone_dir.display());
+        let _ = fs::remove_dir_all(clone_dir);
+        return Err(e);
+    }
 
-    // 4. Render CLAUDE.md
-    println!("Rendering CLAUDE.md...");
-    let claude_md = render_claude_md(&cli.languages, &rules_dir)?;
-    let claude_path = clone_dir.join("CLAUDE.md");
-    fs::write(&claude_path, claude_md)?;
-
-    // 5. Update settings with hooks
-    println!("Configuring hooks: {:?}", cli.hooks);
-    update_settings_with_hooks(&cli.hooks, clone_dir)?;
-
-    // 6. Filter .mcp.json
-    println!("Configuring MCP servers: {:?}", cli.mcp);
-    filter_mcp_json(&cli.mcp, clone_dir)?;
-
-    // 7. Copy files to working directory
-    println!("Copying files...");
-    copy_files(clone_dir)?;
-
-    // 8. Cleanup
+    // 8. Cleanup (success path)
     println!("Cleaning up...");
     cleanup(clone_dir)?;
 
