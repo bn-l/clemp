@@ -61,8 +61,18 @@ claude-template/
 ├── hooks-template/
 │   ├── sound.json
 │   └── ...
+├── lang-files/                  # Optional language-specific files
+│   ├── typescript/
+│   │   └── ...                  # Files copied when ts/typescript specified
+│   ├── swift/
+│   │   └── ...
+│   └── ...
 └── gitignore-additions
 ```
+
+### Language-specific files
+
+The `lang-files/` directory allows you to include extra files that are only copied when a specific language is specified. For example, if you run `clemp swift`, any files in `lang-files/swift/` will be copied to your project root.
 
 The `CLAUDE-template.md` uses [MiniJinja](https://github.com/mitsuhiko/minijinja) syntax with access to:
 - `languages` - list of canonical language names

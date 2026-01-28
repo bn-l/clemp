@@ -365,6 +365,38 @@ fn filter_mcp_json(mcp_servers: &[String], clone_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_lang_files(languages: &[String], clone_dir: &Path) -> Result<()> {
+    let lang_files_dir = clone_dir.join("lang-files");
+    if !lang_files_dir.exists() {
+        return Ok(());
+    }
+
+    for lang in languages {
+        let canonical = normalize_language(lang)
+            .map(String::from)
+            .unwrap_or_else(|| lang.to_lowercase());
+
+        let lang_dir = lang_files_dir.join(&canonical);
+        if lang_dir.exists() && lang_dir.is_dir() {
+            println!("Copying lang-files/{}...", canonical);
+            for entry in fs::read_dir(&lang_dir)? {
+                let entry = entry?;
+                let src = entry.path();
+                let dest = Path::new(".").join(entry.file_name());
+
+                if src.is_dir() {
+                    copy_dir_recursive(&src, &dest)?;
+                } else {
+                    fs::copy(&src, &dest)
+                        .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn copy_files(clone_dir: &Path) -> Result<()> {
     let exclude = [
         ".git",
@@ -372,6 +404,7 @@ fn copy_files(clone_dir: &Path) -> Result<()> {
         "rules-templates",
         "README.md",
         "gitignore-additions",
+        "lang-files",
     ];
 
     for entry in fs::read_dir(clone_dir)? {
@@ -443,6 +476,9 @@ fn run_setup(cli: &Cli, clone_dir: &Path, rules_dir: &Path) -> Result<()> {
     // Copy files to working directory
     println!("Copying files...");
     copy_files(clone_dir)?;
+
+    // Copy language-specific files
+    copy_lang_files(&cli.languages, clone_dir)?;
 
     Ok(())
 }
