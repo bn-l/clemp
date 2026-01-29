@@ -110,8 +110,11 @@ fn normalize_language(input: &str) -> Option<&'static str> {
 }
 
 fn clone_repo(repo_url: &str) -> Result<()> {
-    if Path::new(CLONE_DIR).exists() {
-        bail!("Directory '{}' already exists. Remove it first.", CLONE_DIR);
+    let clone_path = Path::new(CLONE_DIR);
+    if clone_path.exists() {
+        eprintln!("Stale '{}' directory found, removing...", CLONE_DIR);
+        fs::remove_dir_all(clone_path)
+            .with_context(|| format!("Failed to remove stale {}", CLONE_DIR))?;
     }
 
     let status = Command::new("git")
@@ -120,6 +123,7 @@ fn clone_repo(repo_url: &str) -> Result<()> {
         .context("Failed to execute git clone")?;
 
     if !status.success() {
+        let _ = fs::remove_dir_all(clone_path);
         bail!("git clone failed with status: {}", status);
     }
     Ok(())
@@ -223,7 +227,8 @@ fn build_language_rules(languages_with_rules: &[String], rules_dir: &Path) -> Re
     Ok(sections.join("\n\n"))
 }
 
-fn render_claude_md(languages: &[String], rules_dir: &Path) -> Result<String> {
+/// Returns (rendered CLAUDE.md, all resolved language names).
+fn render_claude_md(languages: &[String], rules_dir: &Path) -> Result<(String, Vec<String>)> {
     let template_path = rules_dir.join("CLAUDE-template.md");
     let template_content = fs::read_to_string(&template_path)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
@@ -262,7 +267,7 @@ fn render_claude_md(languages: &[String], rules_dir: &Path) -> Result<String> {
         })
         .context("Failed to render template")?;
 
-    Ok(rendered)
+    Ok((rendered, all_languages))
 }
 
 fn update_settings_with_hooks(hooks: &[String], clone_dir: &Path) -> Result<()> {
@@ -372,22 +377,22 @@ fn copy_lang_files(languages: &[String], clone_dir: &Path) -> Result<()> {
     }
 
     for lang in languages {
-        let canonical = normalize_language(lang)
-            .map(String::from)
-            .unwrap_or_else(|| lang.to_lowercase());
-
-        let lang_dir = lang_files_dir.join(&canonical);
+        let lang_dir = lang_files_dir.join(lang);
         if lang_dir.exists() && lang_dir.is_dir() {
-            println!("Copying lang-files/{}...", canonical);
-            for entry in fs::read_dir(&lang_dir)? {
-                let entry = entry?;
-                let src = entry.path();
-                let dest = Path::new(".").join(entry.file_name());
+            let sources: Vec<PathBuf> = fs::read_dir(&lang_dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
 
+            check_no_conflicts(&sources)?;
+
+            println!("Copying lang-files/{}...", lang);
+            for src in &sources {
+                let dest = Path::new(".").join(src.file_name().unwrap());
                 if src.is_dir() {
-                    copy_dir_recursive(&src, &dest)?;
+                    copy_dir_recursive(src, &dest)?;
                 } else {
-                    fs::copy(&src, &dest)
+                    fs::copy(src, &dest)
                         .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
                 }
             }
@@ -397,32 +402,48 @@ fn copy_lang_files(languages: &[String], clone_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn check_no_conflicts(sources: &[PathBuf]) -> Result<()> {
+    let conflicts: Vec<_> = sources
+        .iter()
+        .map(|src| Path::new(".").join(src.file_name().unwrap()))
+        .filter(|dest| dest.exists())
+        .collect();
+
+    if !conflicts.is_empty() {
+        let names: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
+        bail!(
+            "The following files/directories already exist and would be overwritten:\n  {}\nRemove them first or run from a clean directory.",
+            names.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 fn copy_files(clone_dir: &Path) -> Result<()> {
     let exclude = [
         ".git",
         "hooks-template",
         "rules-templates",
         "README.md",
+        ".gitignore",
         "gitignore-additions",
         "lang-files",
     ];
 
-    for entry in fs::read_dir(clone_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
+    let sources: Vec<PathBuf> = fs::read_dir(clone_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| !exclude.contains(&e.file_name().to_string_lossy().as_ref()))
+        .map(|e| e.path())
+        .collect();
 
-        if exclude.contains(&name_str.as_ref()) {
-            continue;
-        }
+    check_no_conflicts(&sources)?;
 
-        let src = entry.path();
-        let dest = Path::new(".").join(&name);
-
+    for src in &sources {
+        let dest = Path::new(".").join(src.file_name().unwrap());
         if src.is_dir() {
-            copy_dir_recursive(&src, &dest)?;
+            copy_dir_recursive(src, &dest)?;
         } else {
-            fs::copy(&src, &dest)
+            fs::copy(src, &dest)
                 .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
         }
     }
@@ -459,9 +480,9 @@ fn run_setup(cli: &Cli, clone_dir: &Path, rules_dir: &Path) -> Result<()> {
     println!("Updating .gitignore...");
     update_gitignore()?;
 
-    // Render CLAUDE.md
+    // Render CLAUDE.md and get resolved languages
     println!("Rendering CLAUDE.md...");
-    let claude_md = render_claude_md(&cli.languages, rules_dir)?;
+    let (claude_md, resolved_languages) = render_claude_md(&cli.languages, rules_dir)?;
     let claude_path = clone_dir.join("CLAUDE.md");
     fs::write(&claude_path, claude_md)?;
 
@@ -477,8 +498,8 @@ fn run_setup(cli: &Cli, clone_dir: &Path, rules_dir: &Path) -> Result<()> {
     println!("Copying files...");
     copy_files(clone_dir)?;
 
-    // Copy language-specific files
-    copy_lang_files(&cli.languages, clone_dir)?;
+    // Copy language-specific files (using resolved languages, not raw input)
+    copy_lang_files(&resolved_languages, clone_dir)?;
 
     Ok(())
 }
