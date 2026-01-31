@@ -504,8 +504,23 @@ fn run_setup(cli: &Cli, clone_dir: &Path, rules_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Split values on whitespace in addition to clap's comma delimiter.
+fn split_multi_values(values: Vec<String>) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|v| v.split_whitespace())
+        .map(String::from)
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.hooks = split_multi_values(cli.hooks);
+    cli.mcp = split_multi_values(cli.mcp);
     let clone_dir = Path::new(CLONE_DIR);
     let rules_dir = clone_dir.join("rules-templates");
 
@@ -516,10 +531,16 @@ fn main() -> Result<()> {
     println!("Cloning {}...", repo_url);
     clone_repo(&repo_url)?;
 
+    // Track whether .gitignore exists before we modify it
+    let gitignore_existed = Path::new(".gitignore").exists();
+
     // 3-7. Run setup steps (with cleanup on error)
     if let Err(e) = run_setup(&cli, clone_dir, &rules_dir) {
         eprintln!("Removing {} due to error...", clone_dir.display());
         let _ = fs::remove_dir_all(clone_dir);
+        if !gitignore_existed {
+            let _ = fs::remove_file(".gitignore");
+        }
         return Err(e);
     }
 

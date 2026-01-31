@@ -8,7 +8,7 @@ A CLI tool for scaffolding [Claude Code](https://docs.anthropic.com/en/docs/clau
 
 With homebrew:
 ```bash
-brew install bn-l/clemp/clemp
+brew install bn-l/tap/clemp
 ```
 
 Or cargo: clone this then:
