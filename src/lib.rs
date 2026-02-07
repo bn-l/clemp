@@ -226,7 +226,7 @@ pub fn build_language_rules(languages_with_rules: &[String], rules_dir: &Path) -
 }
 
 /// Returns (rendered CLAUDE.md, all resolved language names).
-pub fn render_claude_md(languages: &[String], rules_dir: &Path) -> Result<(String, Vec<String>)> {
+pub fn render_claude_md(languages: &[String], mcps: &[String], rules_dir: &Path) -> Result<(String, Vec<String>)> {
     let template_path = rules_dir.join("CLAUDE-template.md");
     let template_content = fs::read_to_string(&template_path)
         .with_context(|| format!("Failed to read {}", template_path.display()))?;
@@ -259,6 +259,7 @@ pub fn render_claude_md(languages: &[String], rules_dir: &Path) -> Result<(Strin
         .render(context! {
             languages => all_languages,
             language_rules => language_rules,
+            mcps => mcps,
         })
         .context("Failed to render template")?;
 
@@ -471,7 +472,7 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path, rules_dir: &Path) -> Result<()> {
     update_gitignore()?;
 
     println!("Rendering CLAUDE.md...");
-    let (claude_md, resolved_languages) = render_claude_md(&cli.languages, rules_dir)?;
+    let (claude_md, resolved_languages) = render_claude_md(&cli.languages, &cli.mcp, rules_dir)?;
     let claude_path = clone_dir.join("CLAUDE.md");
     fs::write(&claude_path, claude_md)?;
 

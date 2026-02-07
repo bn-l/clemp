@@ -163,7 +163,7 @@ fn render_claude_md_basic() {
     );
 
     let rules_dir = s.path().join("rules-templates");
-    let (rendered, resolved) = render_claude_md(&["ts".into()], &rules_dir).unwrap();
+    let (rendered, resolved) = render_claude_md(&["ts".into()], &[], &rules_dir).unwrap();
 
     assert_eq!(resolved, vec!["typescript"]);
     assert!(rendered.contains("Languages: typescript"));
@@ -184,7 +184,7 @@ fn render_claude_md_multiple_languages() {
 
     let rules_dir = s.path().join("rules-templates");
     let (rendered, resolved) =
-        render_claude_md(&["ts".into(), "rs".into()], &rules_dir).unwrap();
+        render_claude_md(&["ts".into(), "rs".into()], &[], &rules_dir).unwrap();
 
     assert_eq!(resolved, vec!["typescript", "rust"]);
     assert!(rendered.contains("typescript, rust"));
@@ -198,7 +198,7 @@ fn render_claude_md_skips_unknown_language() {
     s.with_rules_template("{{ languages | join(', ') }}", &[]);
 
     let rules_dir = s.path().join("rules-templates");
-    let (rendered, resolved) = render_claude_md(&["nope".into()], &rules_dir).unwrap();
+    let (rendered, resolved) = render_claude_md(&["nope".into()], &[], &rules_dir).unwrap();
 
     assert!(resolved.is_empty());
     assert_eq!(rendered.trim(), "");
@@ -213,8 +213,96 @@ fn render_claude_md_conditional_only_language_in_list() {
     );
 
     let rules_dir = s.path().join("rules-templates");
-    let (rendered, resolved) = render_claude_md(&["swift".into()], &rules_dir).unwrap();
+    let (rendered, resolved) = render_claude_md(&["swift".into()], &[], &rules_dir).unwrap();
 
     assert_eq!(resolved, vec!["swift"]);
     assert!(rendered.contains("HAS_SWIFT"));
+}
+
+// ── render_claude_md MCP conditionals ───────────────────────────────────
+
+#[test]
+fn render_claude_md_mcp_conditional_included() {
+    let s = Scaffold::new();
+    s.with_rules_template(
+        r#"base{% if "textbelt" in mcps %}
+<textbelt>
+Send SMS via textbelt
+</textbelt>{% endif %}"#,
+        &[],
+    );
+
+    let rules_dir = s.path().join("rules-templates");
+    let (rendered, _) = render_claude_md(&[], &["textbelt".into()], &rules_dir).unwrap();
+
+    assert!(rendered.contains("<textbelt>"));
+    assert!(rendered.contains("Send SMS via textbelt"));
+}
+
+#[test]
+fn render_claude_md_mcp_conditional_excluded() {
+    let s = Scaffold::new();
+    s.with_rules_template(
+        r#"base{% if "textbelt" in mcps %}
+<textbelt>
+Send SMS via textbelt
+</textbelt>{% endif %}"#,
+        &[],
+    );
+
+    let rules_dir = s.path().join("rules-templates");
+    let (rendered, _) = render_claude_md(&[], &["context7".into()], &rules_dir).unwrap();
+
+    assert!(!rendered.contains("<textbelt>"));
+    assert!(rendered.contains("base"));
+}
+
+#[test]
+fn render_claude_md_multiple_mcp_conditionals() {
+    let s = Scaffold::new();
+    s.with_rules_template(
+        r#"{% if "textbelt" in mcps %}TEXTBELT{% endif %} {% if "sentry" in mcps %}SENTRY{% endif %}"#,
+        &[],
+    );
+
+    let rules_dir = s.path().join("rules-templates");
+    let (rendered, _) =
+        render_claude_md(&[], &["textbelt".into(), "sentry".into()], &rules_dir).unwrap();
+
+    assert!(rendered.contains("TEXTBELT"));
+    assert!(rendered.contains("SENTRY"));
+}
+
+#[test]
+fn render_claude_md_mcp_and_language_conditionals_together() {
+    let s = Scaffold::new();
+    s.with_rules_template(
+        r#"{% if "typescript" in languages %}TS{% endif %} {% if "textbelt" in mcps %}SMS{% endif %}
+{{ language_rules }}"#,
+        &[("typescript-rules.md", "ts rules")],
+    );
+
+    let rules_dir = s.path().join("rules-templates");
+    let (rendered, resolved) =
+        render_claude_md(&["ts".into()], &["textbelt".into()], &rules_dir).unwrap();
+
+    assert_eq!(resolved, vec!["typescript"]);
+    assert!(rendered.contains("TS"));
+    assert!(rendered.contains("SMS"));
+    assert!(rendered.contains("<typescript-rules>"));
+}
+
+#[test]
+fn render_claude_md_empty_mcps() {
+    let s = Scaffold::new();
+    s.with_rules_template(
+        r#"base{% if "textbelt" in mcps %} TEXTBELT{% endif %}"#,
+        &[],
+    );
+
+    let rules_dir = s.path().join("rules-templates");
+    let (rendered, _) = render_claude_md(&[], &[], &rules_dir).unwrap();
+
+    assert!(!rendered.contains("TEXTBELT"));
+    assert!(rendered.contains("base"));
 }
