@@ -1,0 +1,6 @@
+.claude/
+.cursor/
+target/
+.mcp.json
+AGENTS.md
+CLAUDE.md
