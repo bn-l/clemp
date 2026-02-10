@@ -1,10 +1,11 @@
-//! Tests for filesystem operations: copy, gitignore, conflicts, cleanup, and integration.
+//! Tests for filesystem operations: copy, gitignore, conflicts, cleanup,
+//! copy_conditional_dir, and run_setup integration.
 
 mod common;
 
 use clemp::{
-    check_no_conflicts, cleanup, copy_dir_recursive, copy_files, copy_lang_files, run_setup,
-    update_gitignore, Cli, CLONE_DIR,
+    check_no_conflicts, cleanup, copy_conditional_dir, copy_dir_recursive, copy_files,
+    run_setup, update_gitignore, Cli, CLONE_DIR,
 };
 use common::{setup_gitignore_test, CwdGuard, Scaffold};
 use serde_json::Value;
@@ -17,21 +18,17 @@ use tempfile::TempDir;
 #[test]
 fn check_no_conflicts_passes_when_clean() {
     let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
-
     let sources = vec![PathBuf::from("/some/dir/nonexistent_file.txt")];
-    check_no_conflicts(&sources).unwrap();
+    check_no_conflicts(&sources, workdir.path()).unwrap();
 }
 
 #[test]
 fn check_no_conflicts_errors_on_existing() {
     let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
-
     fs::write(workdir.path().join("conflict.txt"), "exists").unwrap();
 
     let sources = vec![PathBuf::from("/some/dir/conflict.txt")];
-    let result = check_no_conflicts(&sources);
+    let result = check_no_conflicts(&sources, workdir.path());
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("conflict.txt"));
 }
@@ -39,8 +36,6 @@ fn check_no_conflicts_errors_on_existing() {
 #[test]
 fn check_no_conflicts_multiple_conflicts() {
     let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
-
     fs::write(workdir.path().join("a.txt"), "").unwrap();
     fs::write(workdir.path().join("b.txt"), "").unwrap();
 
@@ -49,7 +44,7 @@ fn check_no_conflicts_multiple_conflicts() {
         PathBuf::from("/dir/b.txt"),
         PathBuf::from("/dir/c.txt"),
     ];
-    let result = check_no_conflicts(&sources);
+    let result = check_no_conflicts(&sources, workdir.path());
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("a.txt"));
@@ -156,31 +151,49 @@ fn gitignore_appends_newline_if_missing() {
 #[test]
 fn copy_files_excludes_reserved_entries() {
     let s = Scaffold::new();
+    // Create all entries that should be excluded
     fs::create_dir_all(s.path().join(".git")).unwrap();
-    fs::create_dir_all(s.path().join("hooks-template")).unwrap();
-    fs::create_dir_all(s.path().join("rules-templates")).unwrap();
-    fs::create_dir_all(s.path().join("lang-files")).unwrap();
+    fs::create_dir_all(s.path().join("commands")).unwrap();
+    fs::create_dir_all(s.path().join("skills")).unwrap();
+    fs::create_dir_all(s.path().join("copied")).unwrap();
+    fs::create_dir_all(s.path().join("hooks")).unwrap();
+    fs::create_dir_all(s.path().join("mcp")).unwrap();
+    fs::create_dir_all(s.path().join("claude-md")).unwrap();
     fs::write(s.path().join("README.md"), "readme").unwrap();
     fs::write(s.path().join(".gitignore"), "ignore").unwrap();
     fs::write(s.path().join("gitignore-additions"), "additions").unwrap();
+    fs::write(s.path().join("CLAUDE.md.jinja"), "template").unwrap();
+    fs::write(s.path().join("settings.local.json"), "settings").unwrap();
 
+    // Files that SHOULD be copied
     fs::write(s.path().join("CLAUDE.md"), "claude").unwrap();
     fs::write(s.path().join(".mcp.json"), "mcp").unwrap();
+    fs::create_dir_all(s.path().join(".claude")).unwrap();
+    fs::write(s.path().join(".claude/settings.local.json"), "s").unwrap();
 
     let workdir = TempDir::new().unwrap();
     let _g = CwdGuard::new(workdir.path());
 
     copy_files(s.path()).unwrap();
 
+    // Should be copied
     assert!(workdir.path().join("CLAUDE.md").exists());
     assert!(workdir.path().join(".mcp.json").exists());
+    assert!(workdir.path().join(".claude/settings.local.json").exists());
+
+    // Should NOT be copied
     assert!(!workdir.path().join("README.md").exists());
     assert!(!workdir.path().join(".gitignore").exists());
     assert!(!workdir.path().join("gitignore-additions").exists());
+    assert!(!workdir.path().join("CLAUDE.md.jinja").exists());
+    assert!(!workdir.path().join("settings.local.json").exists());
     assert!(!workdir.path().join(".git").exists());
-    assert!(!workdir.path().join("hooks-template").exists());
-    assert!(!workdir.path().join("rules-templates").exists());
-    assert!(!workdir.path().join("lang-files").exists());
+    assert!(!workdir.path().join("commands").exists());
+    assert!(!workdir.path().join("skills").exists());
+    assert!(!workdir.path().join("copied").exists());
+    assert!(!workdir.path().join("hooks").exists());
+    assert!(!workdir.path().join("mcp").exists());
+    assert!(!workdir.path().join("claude-md").exists());
 }
 
 #[test]
@@ -198,73 +211,118 @@ fn copy_files_errors_on_conflict() {
     assert!(result.unwrap_err().to_string().contains("CLAUDE.md"));
 }
 
-// ── copy_lang_files ─────────────────────────────────────────────────────
+// ── copy_conditional_dir ────────────────────────────────────────────────
 
 #[test]
-fn copy_lang_files_copies_matching_language() {
+fn copy_conditional_default_only() {
     let s = Scaffold::new();
-    s.with_lang_files("typescript", &[("tsconfig.json", r#"{"strict": true}"#)]);
+    s.with_commands("default", &[("commit.md", "commit cmd"), ("isolated.md", "iso cmd")]);
 
-    let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
-
-    copy_lang_files(&["typescript".into()], s.path()).unwrap();
+    let dest = TempDir::new().unwrap();
+    copy_conditional_dir(&s.path().join("commands"), &[], dest.path()).unwrap();
 
     assert_eq!(
-        fs::read_to_string(workdir.path().join("tsconfig.json")).unwrap(),
-        r#"{"strict": true}"#
+        fs::read_to_string(dest.path().join("commit.md")).unwrap(),
+        "commit cmd"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("isolated.md")).unwrap(),
+        "iso cmd"
     );
 }
 
 #[test]
-fn copy_lang_files_ignores_missing_lang_dir() {
+fn copy_conditional_with_language() {
     let s = Scaffold::new();
-    fs::create_dir_all(s.path().join("lang-files")).unwrap();
+    s.with_commands("default", &[("commit.md", "commit cmd")]);
+    s.with_commands("svelte", &[("svelte.md", "svelte cmd")]);
 
-    let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
+    let dest = TempDir::new().unwrap();
+    copy_conditional_dir(
+        &s.path().join("commands"),
+        &["svelte".into()],
+        dest.path(),
+    )
+    .unwrap();
 
-    copy_lang_files(&["rust".into()], s.path()).unwrap();
+    assert!(dest.path().join("commit.md").exists());
+    assert!(dest.path().join("svelte.md").exists());
 }
 
 #[test]
-fn copy_lang_files_no_lang_files_dir_is_ok() {
+fn copy_conditional_language_overrides_default() {
     let s = Scaffold::new();
+    s.with_commands("default", &[("shared.md", "default version")]);
+    s.with_commands("svelte", &[("shared.md", "svelte version")]);
 
-    let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
+    let dest = TempDir::new().unwrap();
+    copy_conditional_dir(
+        &s.path().join("commands"),
+        &["svelte".into()],
+        dest.path(),
+    )
+    .unwrap();
 
-    copy_lang_files(&["rust".into()], s.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(dest.path().join("shared.md")).unwrap(),
+        "svelte version"
+    );
 }
 
 #[test]
-fn copy_lang_files_conflict_errors() {
+fn copy_conditional_missing_lang_dir_ok() {
     let s = Scaffold::new();
-    s.with_lang_files("rust", &[("Cargo.toml", "content")]);
+    s.with_commands("default", &[("commit.md", "cmd")]);
+
+    let dest = TempDir::new().unwrap();
+    copy_conditional_dir(
+        &s.path().join("commands"),
+        &["rust".into()],
+        dest.path(),
+    )
+    .unwrap();
+
+    assert!(dest.path().join("commit.md").exists());
+}
+
+#[test]
+fn copy_conditional_missing_source_dir_ok() {
+    let s = Scaffold::new();
+    let dest = TempDir::new().unwrap();
+
+    copy_conditional_dir(&s.path().join("commands"), &[], dest.path()).unwrap();
+}
+
+#[test]
+fn copy_conditional_conflict_errors() {
+    let s = Scaffold::new();
+    s.with_copied("default", &[("AGENTS.md", "agents")]);
 
     let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
+    fs::write(workdir.path().join("AGENTS.md"), "existing").unwrap();
 
-    fs::write(workdir.path().join("Cargo.toml"), "existing").unwrap();
-
-    let result = copy_lang_files(&["rust".into()], s.path());
+    let result = copy_conditional_dir(
+        &s.path().join("copied"),
+        &[],
+        workdir.path(),
+    );
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Cargo.toml"));
+    assert!(result.unwrap_err().to_string().contains("AGENTS.md"));
 }
 
 #[test]
-fn copy_lang_files_multiple_languages() {
+fn copy_conditional_skills_recursive() {
     let s = Scaffold::new();
-    s.with_lang_files("typescript", &[("tsconfig.json", "ts")]);
-    s.with_lang_files("rust", &[("rustfmt.toml", "rs")]);
+    let skill_dir = s.path().join("skills/default/my-skill");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), "skill content").unwrap();
+    fs::write(skill_dir.join("README.md"), "readme").unwrap();
 
-    let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
+    let dest = TempDir::new().unwrap();
+    copy_conditional_dir(&s.path().join("skills"), &[], dest.path()).unwrap();
 
-    copy_lang_files(&["typescript".into(), "rust".into()], s.path()).unwrap();
-
-    assert!(workdir.path().join("tsconfig.json").exists());
-    assert!(workdir.path().join("rustfmt.toml").exists());
+    assert!(dest.path().join("my-skill/SKILL.md").exists());
+    assert!(dest.path().join("my-skill/README.md").exists());
 }
 
 // ── cleanup ─────────────────────────────────────────────────────────────
@@ -298,7 +356,6 @@ fn error_cleanup_removes_new_gitignore() {
 
     fs::write(".gitignore", "# Claude related\n.claude/\n").unwrap();
 
-    // Simulate the error cleanup logic from main()
     if !gitignore_existed {
         let _ = fs::remove_file(".gitignore");
     }
@@ -322,19 +379,38 @@ fn error_cleanup_preserves_existing_gitignore() {
     assert_eq!(fs::read_to_string(".gitignore").unwrap(), "node_modules/\n");
 }
 
-// ── run_setup integration (end-to-end minus git clone) ──────────────────
+// ── run_setup integration ───────────────────────────────────────────────
 
 #[test]
 fn run_setup_full_flow() {
     let s = Scaffold::new();
+
+    // Template
     s.with_gitignore_additions(".claude/\n");
-    s.with_rules_template(
-        "Hello {{ languages | join(', ') }}\n{{ language_rules }}",
-        &[("typescript-rules.md", "strict mode")],
+    s.with_template(
+        "{%- if lang %}Languages: {% for l in lang %}{{ l }} {% endfor %}\n{{ lang_rules }}{%- endif %}\n{{ mcp_rules }}",
+        &[("typescript.md", "strict mode")],
     );
-    s.with_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
-    s.with_settings("{}");
-    s.with_mcp(r#"{"mcpServers": {"context7": {"cmd": "c7"}}}"#);
+
+    // Settings + hooks
+    s.with_settings(r#"{"permissions": {"allow": []}}"#);
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
+
+    // MCP
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+
+    // Commands
+    s.with_commands("default", &[("commit.md", "commit command")]);
+
+    // Skills
+    let skill_dir = s.path().join("skills/default/my-skill");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), "skill").unwrap();
+
+    // Copied
+    s.with_copied("default", &[(".editorconfig", "config")]);
+
+    // An extra file at clone root that should be copied
     fs::write(s.path().join("somefile.txt"), "hello").unwrap();
 
     let workdir = TempDir::new().unwrap();
@@ -346,35 +422,268 @@ fn run_setup_full_flow() {
     let cli = Cli {
         version: (),
         languages: vec!["ts".into()],
-        hooks: vec!["sound".into()],
-        mcp: vec!["context7".into()],
+        hooks: vec![],
+        mcp: vec![],
     };
 
-    run_setup(&cli, s.path(), &s.path().join("rules-templates")).unwrap();
+    run_setup(&cli, s.path()).unwrap();
 
     // .gitignore created with additions
     let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains(".claude/"));
 
-    // CLAUDE.md rendered in clone dir
-    let claude = fs::read_to_string(s.path().join("CLAUDE.md")).unwrap();
-    assert!(claude.contains("Hello typescript"));
+    // CLAUDE.md rendered in clone dir then copied to workdir
+    let claude = fs::read_to_string(workdir.path().join("CLAUDE.md")).unwrap();
+    assert!(claude.contains("typescript"));
     assert!(claude.contains("<typescript-rules>"));
 
-    // Settings has hooks
+    // Settings has hooks + enabledMcpjsonServers
     let settings: Value = serde_json::from_str(
-        &fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap(),
+        &fs::read_to_string(workdir.path().join(".claude/settings.local.json")).unwrap(),
     )
     .unwrap();
     assert!(settings["hooks"]["Notification"].is_array());
+    assert!(settings["permissions"]["allow"].is_array());
+    let enabled = settings["enabledMcpjsonServers"].as_array().unwrap();
+    assert!(enabled.contains(&Value::String("context7".into())));
 
-    // MCP filtered
+    // .mcp.json assembled
     let mcp: Value = serde_json::from_str(
-        &fs::read_to_string(s.path().join(".mcp.json")).unwrap(),
+        &fs::read_to_string(workdir.path().join(".mcp.json")).unwrap(),
     )
     .unwrap();
     assert!(mcp["mcpServers"]["context7"].is_object());
 
-    // somefile.txt copied to workdir
+    // Commands copied
+    assert!(workdir.path().join(".claude/commands/commit.md").exists());
+
+    // Skills copied
+    assert!(workdir.path().join(".claude/skills/my-skill/SKILL.md").exists());
+
+    // Copied files
+    assert!(workdir.path().join(".editorconfig").exists());
+
+    // Extra file copied
     assert!(workdir.path().join("somefile.txt").exists());
+}
+
+// ── copy_conditional_dir (multiple languages) ───────────────────────────
+
+#[test]
+fn copy_conditional_multiple_languages() {
+    let s = Scaffold::new();
+    s.with_commands("default", &[("base.md", "base cmd")]);
+    s.with_commands("svelte", &[("sv.md", "svelte cmd")]);
+    s.with_commands("typescript", &[("ts.md", "ts cmd")]);
+
+    let dest = TempDir::new().unwrap();
+    copy_conditional_dir(
+        &s.path().join("commands"),
+        &["svelte".into(), "typescript".into()],
+        dest.path(),
+    )
+    .unwrap();
+
+    assert!(dest.path().join("base.md").exists());
+    assert!(dest.path().join("sv.md").exists());
+    assert!(dest.path().join("ts.md").exists());
+}
+
+#[test]
+fn copy_conditional_copied_with_lang_files() {
+    let s = Scaffold::new();
+    s.with_copied("default", &[("editor.cfg", "editor config")]);
+    s.with_copied("swift", &[("swift-lint.yml", "swift lint config")]);
+
+    let dest = TempDir::new().unwrap();
+    copy_conditional_dir(
+        &s.path().join("copied"),
+        &["swift".into()],
+        dest.path(),
+    )
+    .unwrap();
+
+    assert!(dest.path().join("editor.cfg").exists());
+    assert!(dest.path().join("swift-lint.yml").exists());
+}
+
+// ── check_no_conflicts (dedup) ──────────────────────────────────────────
+
+#[test]
+fn check_no_conflicts_dedup() {
+    let workdir = TempDir::new().unwrap();
+    fs::write(workdir.path().join("shared.md"), "exists").unwrap();
+
+    let sources = vec![
+        PathBuf::from("/dir1/shared.md"),
+        PathBuf::from("/dir2/shared.md"),
+    ];
+    let result = check_no_conflicts(&sources, workdir.path());
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert_eq!(
+        msg.matches("shared.md").count(),
+        1,
+        "should dedup to one mention"
+    );
+}
+
+// ── run_setup integration (named hooks + MCPs) ──────────────────────────
+
+#[test]
+fn run_setup_with_named_hooks_and_mcps() {
+    let s = Scaffold::new();
+
+    s.with_gitignore_additions(".claude/\n");
+    s.with_template(
+        "{{ lang_rules }}\n{{ mcp_rules }}",
+        &[("typescript.md", "ts rules")],
+    );
+    s.with_settings(r#"{"permissions": {"allow": []}}"#);
+
+    // Default + named hook
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
+    s.with_named_hooks(&[("blocker", r#"{"PreToolUse": [{"command": "block-tool"}]}"#)]);
+
+    // Default + named MCP
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_named_mcps(&[("maps", r#"{"maps": {"url": "maps"}}"#)]);
+
+    // Commands
+    s.with_commands("default", &[("commit.md", "commit cmd")]);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec!["ts".into()],
+        hooks: vec!["blocker".into()],
+        mcp: vec!["maps".into()],
+    };
+
+    run_setup(&cli, s.path()).unwrap();
+
+    // Settings has both default + blocker hooks merged
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(workdir.path().join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(settings["hooks"]["Notification"].is_array());
+    assert!(settings["hooks"]["PreToolUse"].is_array());
+
+    // enabledMcpjsonServers includes both context7 and maps
+    let enabled = settings["enabledMcpjsonServers"].as_array().unwrap();
+    assert!(enabled.contains(&Value::String("context7".into())));
+    assert!(enabled.contains(&Value::String("maps".into())));
+
+    // .mcp.json has both servers
+    let mcp: Value = serde_json::from_str(
+        &fs::read_to_string(workdir.path().join(".mcp.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(mcp["mcpServers"]["context7"].is_object());
+    assert!(mcp["mcpServers"]["maps"].is_object());
+}
+
+// ── run_setup integration (language conditionals) ───────────────────────
+
+#[test]
+fn run_setup_with_lang_conditionals() {
+    let s = Scaffold::new();
+
+    s.with_gitignore_additions(".claude/\n");
+    s.with_template("base", &[]);
+
+    // Commands: default + svelte
+    s.with_commands("default", &[("base.md", "base cmd")]);
+    s.with_commands("svelte", &[("sv.md", "svelte cmd")]);
+
+    // Skills: svelte
+    let skill_dir = s.path().join("skills/svelte/sv-skill");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), "svelte skill").unwrap();
+
+    // Copied: svelte
+    s.with_copied("svelte", &[("sv-lint.yml", "svelte lint config")]);
+
+    // MCP: default + svelte
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_lang_mcps("svelte", &[("svelte-mcp", r#"{"svelte-mcp": {"url": "sv"}}"#)]);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec!["svelte".into()],
+        hooks: vec![],
+        mcp: vec![],
+    };
+
+    run_setup(&cli, s.path()).unwrap();
+
+    // Commands
+    assert!(workdir.path().join(".claude/commands/base.md").exists());
+    assert!(workdir.path().join(".claude/commands/sv.md").exists());
+
+    // Skills
+    assert!(workdir
+        .path()
+        .join(".claude/skills/sv-skill/SKILL.md")
+        .exists());
+
+    // Copied to workdir root
+    assert!(workdir.path().join("sv-lint.yml").exists());
+
+    // .mcp.json has both servers
+    let mcp: Value = serde_json::from_str(
+        &fs::read_to_string(workdir.path().join(".mcp.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(mcp["mcpServers"]["context7"].is_object());
+    assert!(mcp["mcpServers"]["svelte-mcp"].is_object());
+}
+
+// ── run_setup integration (multiple languages) ──────────────────────────
+
+#[test]
+fn run_setup_multiple_languages() {
+    let s = Scaffold::new();
+
+    s.with_gitignore_additions(".claude/\n");
+    s.with_template(
+        "Languages: {% for l in lang %}{{ l }} {% endfor %}\n{{ lang_rules }}",
+        &[("svelte.md", "svelte rules"), ("typescript.md", "ts rules")],
+    );
+
+    // Commands: default + svelte + typescript
+    s.with_commands("default", &[("base.md", "base cmd")]);
+    s.with_commands("svelte", &[("sv.md", "svelte cmd")]);
+    s.with_commands("typescript", &[("ts.md", "ts cmd")]);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec!["ts".into(), "svelte".into()],
+        hooks: vec![],
+        mcp: vec![],
+    };
+
+    run_setup(&cli, s.path()).unwrap();
+
+    // CLAUDE.md contains both language rules
+    let claude = fs::read_to_string(workdir.path().join("CLAUDE.md")).unwrap();
+    assert!(claude.contains("<typescript-rules>"));
+    assert!(claude.contains("<svelte-rules>"));
+
+    // Commands dir has all three files
+    assert!(workdir.path().join(".claude/commands/base.md").exists());
+    assert!(workdir.path().join(".claude/commands/sv.md").exists());
+    assert!(workdir.path().join(".claude/commands/ts.md").exists());
 }

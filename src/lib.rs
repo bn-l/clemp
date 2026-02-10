@@ -3,16 +3,18 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use minijinja::{context, Environment};
+use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
 pub const CLONE_DIR: &str = "claude-template";
+
+// ── Config ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
@@ -70,6 +72,8 @@ pub fn get_repo_url() -> Result<String> {
     Ok(url)
 }
 
+// ── CLI ──────────────────────────────────────────────────────────────────
+
 #[derive(Parser)]
 #[command(version, about = "Clone and configure claude-template for your project", disable_version_flag = true)]
 pub struct Cli {
@@ -81,14 +85,16 @@ pub struct Cli {
     #[arg(value_name = "LANGUAGE")]
     pub languages: Vec<String>,
 
-    /// Hook names to include (comma or space separated)
-    #[arg(long, value_delimiter = ',', num_args = 1.., default_value = "sound")]
+    /// Extra hook names to include (comma or space separated)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub hooks: Vec<String>,
 
-    /// MCP server names to keep (comma or space separated)
-    #[arg(long, value_delimiter = ',', num_args = 1.., default_value = "context7")]
+    /// Extra MCP server names to include (comma or space separated)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub mcp: Vec<String>,
 }
+
+// ── Language handling ────────────────────────────────────────────────────
 
 pub fn normalize_language(input: &str) -> Option<&'static str> {
     match input.to_lowercase().as_str() {
@@ -107,6 +113,386 @@ pub fn normalize_language(input: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+pub enum LanguageResolution {
+    HasRulesFile(String),
+    ConditionalOnly(String),
+    NoMatch,
+}
+
+/// Resolve a language input against the template's rules files and conditional directories.
+pub fn resolve_language(input: &str, clone_dir: &Path) -> LanguageResolution {
+    let canonical = normalize_language(input)
+        .map(String::from)
+        .unwrap_or_else(|| input.to_lowercase());
+
+    let rules_file = clone_dir
+        .join("claude-md/lang-rules")
+        .join(format!("{}.md", canonical));
+
+    if rules_file.exists() {
+        return LanguageResolution::HasRulesFile(canonical);
+    }
+
+    let has_conditional = ["commands", "skills", "copied", "mcp"]
+        .iter()
+        .any(|dir| clone_dir.join(dir).join(&canonical).is_dir());
+
+    if has_conditional {
+        eprintln!(
+            "Warning: No rules file for '{}', but has conditional directories for it",
+            canonical
+        );
+        LanguageResolution::ConditionalOnly(canonical)
+    } else {
+        LanguageResolution::NoMatch
+    }
+}
+
+/// Resolve all language inputs, erroring on unknown languages.
+pub fn resolve_all_languages(inputs: &[String], clone_dir: &Path) -> Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for lang in inputs {
+        match resolve_language(lang, clone_dir) {
+            LanguageResolution::HasRulesFile(canonical) | LanguageResolution::ConditionalOnly(canonical) => {
+                resolved.push(canonical);
+            }
+            LanguageResolution::NoMatch => {
+                let canonical = normalize_language(lang)
+                    .map(String::from)
+                    .unwrap_or_else(|| lang.to_lowercase());
+                bail!(
+                    "Unknown language '{}': no rules file (claude-md/lang-rules/{}.md) and no conditional directories in template",
+                    lang,
+                    canonical
+                );
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+// ── Rules building ───────────────────────────────────────────────────────
+
+pub fn build_language_rules(languages: &[String], claude_md_dir: &Path) -> Result<String> {
+    let lang_rules_dir = claude_md_dir.join("lang-rules");
+    let mut sections = Vec::new();
+
+    for canonical in languages {
+        let rules_file = lang_rules_dir.join(format!("{}.md", canonical));
+        if !rules_file.exists() {
+            continue; // ConditionalOnly languages have no rules file
+        }
+        let content = fs::read_to_string(&rules_file)
+            .with_context(|| format!("Failed to read {}", rules_file.display()))?;
+
+        sections.push(format!(
+            "<{}-rules>\n{}\n</{}-rules>",
+            canonical,
+            content.trim(),
+            canonical
+        ));
+    }
+
+    Ok(sections.join("\n\n"))
+}
+
+pub fn build_mcp_rules(active_mcps: &[String], claude_md_dir: &Path) -> Result<String> {
+    let mcp_rules_dir = claude_md_dir.join("mcp-rules");
+    let mut sections = Vec::new();
+
+    for name in active_mcps {
+        let rules_file = mcp_rules_dir.join(format!("{}.md", name));
+        if !rules_file.exists() {
+            continue; // Not all MCPs have rules — that's fine
+        }
+        let content = fs::read_to_string(&rules_file)
+            .with_context(|| format!("Failed to read {}", rules_file.display()))?;
+
+        sections.push(format!(
+            "<{}-mcp-rules>\n{}\n</{}-mcp-rules>",
+            name,
+            content.trim(),
+            name
+        ));
+    }
+
+    Ok(sections.join("\n\n"))
+}
+
+// ── MCP assembly ─────────────────────────────────────────────────────────
+
+/// Read all .json files from a directory and merge their top-level key-value pairs.
+fn read_json_dir(dir: &Path) -> Result<Map<String, Value>> {
+    let mut merged = Map::new();
+    if !dir.is_dir() {
+        return Ok(merged);
+    }
+    let mut entries: Vec<_> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map_or(false, |ext| ext == "json")
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let content = fs::read_to_string(&path)?;
+        let obj: Map<String, Value> = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        merged.extend(obj);
+    }
+    Ok(merged)
+}
+
+/// Assemble .mcp.json from default/, language, and named MCP server files.
+/// Returns the assembled JSON and the list of all server names.
+pub fn assemble_mcp_json(
+    languages: &[String],
+    named_mcps: &[String],
+    clone_dir: &Path,
+) -> Result<(Value, Vec<String>)> {
+    let mcp_dir = clone_dir.join("mcp");
+
+    if !mcp_dir.exists() {
+        if !named_mcps.is_empty() {
+            bail!("--mcp specified but no mcp/ directory in template");
+        }
+        return Ok((serde_json::json!({"mcpServers": {}}), vec![]));
+    }
+
+    let mut servers = Map::new();
+
+    // 1. Default MCPs (always)
+    servers.extend(read_json_dir(&mcp_dir.join("default"))?);
+
+    // 2. Language-matched MCPs
+    for lang in languages {
+        servers.extend(read_json_dir(&mcp_dir.join(lang))?);
+    }
+
+    // 3. Named MCPs from --mcp flag
+    for name in named_mcps {
+        let path = mcp_dir.join(format!("{}.json", name));
+        if !path.exists() {
+            let available: Vec<_> = fs::read_dir(&mcp_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let p = e.path();
+                    p.is_file() && p.extension().map_or(false, |ext| ext == "json")
+                })
+                .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
+                .collect();
+            bail!(
+                "MCP '{}' not found in {}. Available: {:?}",
+                name,
+                mcp_dir.display(),
+                available
+            );
+        }
+        let content = fs::read_to_string(&path)?;
+        let obj: Map<String, Value> = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        servers.extend(obj);
+    }
+
+    let names: Vec<String> = servers.keys().cloned().collect();
+    let mcp_json = serde_json::json!({ "mcpServers": servers });
+
+    Ok((mcp_json, names))
+}
+
+// ── Settings / hooks ─────────────────────────────────────────────────────
+
+/// Merge hook entries from a JSON file into the accumulated hooks map.
+fn merge_hook_file(path: &Path, dest: &mut Map<String, Value>) -> Result<()> {
+    let content = fs::read_to_string(path)?;
+    let hook_json: Value =
+        serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
+    let hook_obj = hook_json
+        .as_object()
+        .with_context(|| format!("{} is not an object", path.display()))?;
+
+    for (hook_type, hook_entries) in hook_obj {
+        let entries = hook_entries
+            .as_array()
+            .with_context(|| format!("'{}' in {} is not an array", hook_type, path.display()))?;
+        dest.entry(hook_type.clone())
+            .or_insert_with(|| Value::Array(vec![]))
+            .as_array_mut()
+            .unwrap()
+            .extend(entries.clone());
+    }
+    Ok(())
+}
+
+/// Build .claude/settings.local.json from base settings + hooks + MCP list.
+pub fn build_settings(
+    named_hooks: &[String],
+    active_mcp_names: &[String],
+    clone_dir: &Path,
+) -> Result<()> {
+    let base_path = clone_dir.join("settings.local.json");
+    let hooks_dir = clone_dir.join("hooks");
+
+    let mut settings: Value = if base_path.exists() {
+        let content = fs::read_to_string(&base_path)?;
+        serde_json::from_str(&content).context("Failed to parse settings.local.json")?
+    } else {
+        serde_json::json!({})
+    };
+
+    let settings_obj = settings
+        .as_object_mut()
+        .context("settings.local.json is not an object")?;
+
+    // Merge hooks: default/ always + named hooks
+    let mut merged_hooks: Map<String, Value> = Map::new();
+
+    let default_hooks_dir = hooks_dir.join("default");
+    if default_hooks_dir.is_dir() {
+        let mut entries: Vec<_> = fs::read_dir(&default_hooks_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == "json")
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            merge_hook_file(&entry.path(), &mut merged_hooks)?;
+        }
+    }
+
+    for name in named_hooks {
+        let path = hooks_dir.join(format!("{}.json", name));
+        if !path.exists() {
+            let available: Vec<_> = fs::read_dir(&hooks_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let p = e.path();
+                    p.is_file() && p.extension().map_or(false, |ext| ext == "json")
+                })
+                .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
+                .collect();
+            bail!(
+                "Hook '{}' not found in {}. Available: {:?}",
+                name,
+                hooks_dir.display(),
+                available
+            );
+        }
+        merge_hook_file(&path, &mut merged_hooks)?;
+    }
+
+    settings_obj.insert("hooks".to_string(), Value::Object(merged_hooks));
+
+    // Update enabledMcpjsonServers
+    let mcp_names: Vec<Value> = active_mcp_names
+        .iter()
+        .map(|n| Value::String(n.clone()))
+        .collect();
+    settings_obj.insert("enabledMcpjsonServers".to_string(), Value::Array(mcp_names));
+
+    // Write to .claude/settings.local.json
+    let claude_dir = clone_dir.join(".claude");
+    fs::create_dir_all(&claude_dir)?;
+    fs::write(
+        claude_dir.join("settings.local.json"),
+        serde_json::to_string_pretty(&settings)?,
+    )?;
+
+    Ok(())
+}
+
+// ── Template rendering ───────────────────────────────────────────────────
+
+/// Render CLAUDE.md from the template and all its parts.
+pub fn render_claude_md(
+    languages: &[String],
+    active_mcp_names: &[String],
+    clone_dir: &Path,
+) -> Result<String> {
+    let template_path = clone_dir.join("CLAUDE.md.jinja");
+    let template_content = fs::read_to_string(&template_path)
+        .with_context(|| format!("Failed to read {}", template_path.display()))?;
+
+    let claude_md_dir = clone_dir.join("claude-md");
+
+    // Build lang dict: {"typescript": true, ...} — truthy if non-empty, dot-accessible
+    let lang_dict: BTreeMap<&str, bool> = languages.iter().map(|l| (l.as_str(), true)).collect();
+
+    // Build mcp dict: {"context7": true, ...}
+    let mcp_dict: BTreeMap<&str, bool> = active_mcp_names.iter().map(|m| (m.as_str(), true)).collect();
+
+    // Build lang_rules and mcp_rules
+    let lang_rules = build_language_rules(languages, &claude_md_dir)?;
+    let mcp_rules = build_mcp_rules(active_mcp_names, &claude_md_dir)?;
+
+    // Build template context as a dynamic map (supports misc variables with dynamic names)
+    let mut ctx = Map::new();
+    ctx.insert("lang".into(), serde_json::to_value(&lang_dict)?);
+    ctx.insert("mcp".into(), serde_json::to_value(&mcp_dict)?);
+    ctx.insert("lang_rules".into(), Value::String(lang_rules));
+    ctx.insert("mcp_rules".into(), Value::String(mcp_rules));
+
+    // Render misc files from claude-md/misc/
+    let misc_dir = claude_md_dir.join("misc");
+    if misc_dir.is_dir() {
+        let env = Environment::new();
+        let partial_ctx = serde_json::json!({ "lang": &lang_dict, "mcp": &mcp_dict });
+
+        let mut entries: Vec<_> = fs::read_dir(&misc_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            let content = fs::read_to_string(entry.path())?;
+
+            let is_jinja = filename.ends_with(".jinja");
+
+            // Strip .jinja then .md to get tag name (keeps hyphens)
+            let base = if is_jinja {
+                &filename[..filename.len() - 6]
+            } else {
+                &filename
+            };
+            let tag_name = base.strip_suffix(".md").unwrap_or(base);
+
+            // Variable name: hyphens → underscores
+            let var_name = tag_name.replace('-', "_");
+
+            let rendered = if is_jinja {
+                env.render_str(&content, &partial_ctx)
+                    .with_context(|| format!("Failed to render {}", filename))?
+            } else {
+                content
+            };
+
+            let wrapped = format!("<{}>\n{}\n</{}>", tag_name, rendered.trim(), tag_name);
+            ctx.insert(var_name, Value::String(wrapped));
+        }
+    }
+
+    // Render the main template
+    let env = Environment::new();
+    let rendered = env
+        .render_str(&template_content, Value::Object(ctx))
+        .context("Failed to render CLAUDE.md.jinja")?;
+
+    Ok(rendered)
+}
+
+// ── Git / filesystem ─────────────────────────────────────────────────────
 
 pub fn clone_repo(repo_url: &str) -> Result<()> {
     let clone_path = Path::new(CLONE_DIR);
@@ -167,237 +553,13 @@ pub fn update_gitignore() -> Result<()> {
     Ok(())
 }
 
-pub fn template_has_conditional(template_content: &str, lang: &str) -> bool {
-    let patterns = [
-        format!(r#""{}" in languages"#, lang),
-        format!(r#"'{}' in languages"#, lang),
-    ];
-    patterns.iter().any(|p| template_content.contains(p))
-}
-
-pub enum LanguageResolution {
-    HasRulesFile(String),
-    ConditionalOnly(String),
-    NoMatch,
-}
-
-pub fn resolve_language(input: &str, rules_dir: &Path, template_content: &str) -> LanguageResolution {
-    let canonical = normalize_language(input)
-        .map(String::from)
-        .unwrap_or_else(|| input.to_lowercase());
-
-    let rules_file = rules_dir.join(format!("{}-rules.md", canonical));
-
-    if rules_file.exists() {
-        LanguageResolution::HasRulesFile(canonical)
-    } else if template_has_conditional(template_content, &canonical) {
-        eprintln!(
-            "Warning: No rules file for '{}', but template has conditional sections for it",
-            canonical
-        );
-        LanguageResolution::ConditionalOnly(canonical)
-    } else {
-        eprintln!(
-            "Warning: Language '{}' has no rules file ({}-rules.md) and no conditional sections in template, skipping",
-            input,
-            canonical
-        );
-        LanguageResolution::NoMatch
-    }
-}
-
-pub fn build_language_rules(languages_with_rules: &[String], rules_dir: &Path) -> Result<String> {
-    let mut sections = Vec::new();
-
-    for canonical in languages_with_rules {
-        let rules_file = rules_dir.join(format!("{}-rules.md", canonical));
-        let content = fs::read_to_string(&rules_file)
-            .with_context(|| format!("Failed to read {}", rules_file.display()))?;
-
-        sections.push(format!(
-            "<{}-rules>\n{}\n</{}-rules>",
-            canonical,
-            content.trim(),
-            canonical
-        ));
-    }
-
-    Ok(sections.join("\n\n"))
-}
-
-/// Returns (rendered CLAUDE.md, all resolved language names).
-pub fn render_claude_md(languages: &[String], mcps: &[String], rules_dir: &Path) -> Result<(String, Vec<String>)> {
-    let template_path = rules_dir.join("CLAUDE-template.md");
-    let template_content = fs::read_to_string(&template_path)
-        .with_context(|| format!("Failed to read {}", template_path.display()))?;
-
-    let mut all_languages = Vec::new();
-    let mut languages_with_rules = Vec::new();
-
-    for lang in languages {
-        match resolve_language(lang, rules_dir, &template_content) {
-            LanguageResolution::HasRulesFile(canonical) => {
-                all_languages.push(canonical.clone());
-                languages_with_rules.push(canonical);
-            }
-            LanguageResolution::ConditionalOnly(canonical) => {
-                all_languages.push(canonical);
-            }
-            LanguageResolution::NoMatch => {}
-        }
-    }
-
-    let language_rules = build_language_rules(&languages_with_rules, rules_dir)?;
-
-    let mut env = Environment::new();
-    env.add_template("claude", &template_content)
-        .context("Failed to add template")?;
-
-    let tmpl = env.get_template("claude").context("Failed to get template")?;
-
-    let rendered = tmpl
-        .render(context! {
-            languages => all_languages,
-            language_rules => language_rules,
-            mcps => mcps,
-        })
-        .context("Failed to render template")?;
-
-    Ok((rendered, all_languages))
-}
-
-pub fn update_settings_with_hooks(hooks: &[String], clone_dir: &Path) -> Result<()> {
-    let settings_path = clone_dir.join(".claude/settings.local.json");
-    let hooks_dir = clone_dir.join("hooks-template");
-
-    let mut settings: Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).context("Failed to parse settings.local.json")?
-    } else {
-        serde_json::json!({})
-    };
-
-    let settings_obj = settings
-        .as_object_mut()
-        .context("settings.local.json is not an object")?;
-
-    let mut merged_hooks: Map<String, Value> = Map::new();
-
-    for hook_name in hooks {
-        let hook_file = hooks_dir.join(format!("{}.json", hook_name));
-        if !hook_file.exists() {
-            bail!(
-                "Hook '{}' not found in {}",
-                hook_name,
-                hooks_dir.display()
-            );
-        }
-
-        let hook_content = fs::read_to_string(&hook_file)?;
-        let hook_json: Value =
-            serde_json::from_str(&hook_content).with_context(|| format!("Failed to parse {}", hook_file.display()))?;
-
-        let hook_obj = hook_json
-            .as_object()
-            .with_context(|| format!("{} is not an object", hook_file.display()))?;
-
-        for (hook_type, hook_entries) in hook_obj {
-            let entries = hook_entries
-                .as_array()
-                .with_context(|| format!("'{}' in {} is not an array", hook_type, hook_file.display()))?;
-
-            merged_hooks
-                .entry(hook_type.clone())
-                .or_insert_with(|| Value::Array(vec![]))
-                .as_array_mut()
-                .unwrap()
-                .extend(entries.clone());
-        }
-    }
-
-    settings_obj.insert("hooks".to_string(), Value::Object(merged_hooks));
-
-    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    Ok(())
-}
-
-pub fn filter_mcp_json(mcp_servers: &[String], clone_dir: &Path) -> Result<()> {
-    let mcp_path = clone_dir.join(".mcp.json");
-    if !mcp_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&mcp_path)?;
-    let mut mcp_json: Value =
-        serde_json::from_str(&content).context("Failed to parse .mcp.json")?;
-
-    let mcp_obj = mcp_json
-        .as_object_mut()
-        .context(".mcp.json is not an object")?;
-
-    let servers = mcp_obj
-        .get_mut("mcpServers")
-        .and_then(|v| v.as_object_mut())
-        .context(".mcp.json missing mcpServers object")?;
-
-    for server in mcp_servers {
-        if !servers.contains_key(server) {
-            bail!(
-                "MCP server '{}' not found in .mcp.json. Available: {:?}",
-                server,
-                servers.keys().collect::<Vec<_>>()
-            );
-        }
-    }
-
-    let to_keep: HashSet<&str> = mcp_servers.iter().map(String::as_str).collect();
-    servers.retain(|k, _| to_keep.contains(k.as_str()));
-
-    if servers.is_empty() {
-        fs::remove_file(&mcp_path)?;
-    } else {
-        fs::write(&mcp_path, serde_json::to_string_pretty(&mcp_json)?)?;
-    }
-
-    Ok(())
-}
-
-pub fn copy_lang_files(languages: &[String], clone_dir: &Path) -> Result<()> {
-    let lang_files_dir = clone_dir.join("lang-files");
-    if !lang_files_dir.exists() {
-        return Ok(());
-    }
-
-    for lang in languages {
-        let lang_dir = lang_files_dir.join(lang);
-        if lang_dir.exists() && lang_dir.is_dir() {
-            let sources: Vec<PathBuf> = fs::read_dir(&lang_dir)?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .collect();
-
-            check_no_conflicts(&sources)?;
-
-            println!("Copying lang-files/{}...", lang);
-            for src in &sources {
-                let dest = Path::new(".").join(src.file_name().unwrap());
-                if src.is_dir() {
-                    copy_dir_recursive(src, &dest)?;
-                } else {
-                    fs::copy(src, &dest)
-                        .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub fn check_no_conflicts(sources: &[PathBuf]) -> Result<()> {
+pub fn check_no_conflicts(sources: &[PathBuf], dest_dir: &Path) -> Result<()> {
     let conflicts: Vec<_> = sources
         .iter()
-        .map(|src| Path::new(".").join(src.file_name().unwrap()))
+        .filter_map(|src| src.file_name())
+        .map(|name| dest_dir.join(name))
+        .collect::<HashSet<_>>() // deduplicate
+        .into_iter()
         .filter(|dest| dest.exists())
         .collect();
 
@@ -408,38 +570,6 @@ pub fn check_no_conflicts(sources: &[PathBuf]) -> Result<()> {
             names.join("\n  ")
         );
     }
-    Ok(())
-}
-
-pub fn copy_files(clone_dir: &Path) -> Result<()> {
-    let exclude = [
-        ".git",
-        "hooks-template",
-        "rules-templates",
-        "README.md",
-        ".gitignore",
-        "gitignore-additions",
-        "lang-files",
-    ];
-
-    let sources: Vec<PathBuf> = fs::read_dir(clone_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| !exclude.contains(&e.file_name().to_string_lossy().as_ref()))
-        .map(|e| e.path())
-        .collect();
-
-    check_no_conflicts(&sources)?;
-
-    for src in &sources {
-        let dest = Path::new(".").join(src.file_name().unwrap());
-        if src.is_dir() {
-            copy_dir_recursive(src, &dest)?;
-        } else {
-            fs::copy(src, &dest)
-                .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
-        }
-    }
-
     Ok(())
 }
 
@@ -461,31 +591,155 @@ pub fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn copy_files(clone_dir: &Path) -> Result<()> {
+    let exclude = [
+        ".git",
+        "README.md",
+        ".gitignore",
+        "gitignore-additions",
+        "CLAUDE.md.jinja",
+        "claude-md",
+        "commands",
+        "skills",
+        "copied",
+        "hooks",
+        "mcp",
+        "settings.local.json",
+    ];
+
+    let sources: Vec<PathBuf> = fs::read_dir(clone_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| !exclude.contains(&e.file_name().to_string_lossy().as_ref()))
+        .map(|e| e.path())
+        .collect();
+
+    check_no_conflicts(&sources, Path::new("."))?;
+
+    for src in &sources {
+        let dest = Path::new(".").join(src.file_name().unwrap());
+        if src.is_dir() {
+            copy_dir_recursive(src, &dest)?;
+        } else {
+            fs::copy(src, &dest)
+                .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy files from source_dir/default/ and source_dir/<lang>/ into dest_dir.
+/// Language dirs override default entries with the same name.
+pub fn copy_conditional_dir(
+    source_dir: &Path,
+    languages: &[String],
+    dest_dir: &Path,
+) -> Result<()> {
+    if !source_dir.exists() {
+        return Ok(());
+    }
+
+    let mut source_dirs = Vec::new();
+    let default_dir = source_dir.join("default");
+    if default_dir.is_dir() {
+        source_dirs.push(default_dir);
+    }
+    for lang in languages {
+        let lang_dir = source_dir.join(lang);
+        if lang_dir.is_dir() {
+            source_dirs.push(lang_dir);
+        }
+    }
+
+    if source_dirs.is_empty() {
+        return Ok(());
+    }
+
+    // Collect all entries for conflict check
+    let all_entries: Vec<PathBuf> = source_dirs
+        .iter()
+        .flat_map(|dir| {
+            fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+        })
+        .collect();
+
+    check_no_conflicts(&all_entries, dest_dir)?;
+
+    // Copy (default first, then language dirs — later entries override)
+    fs::create_dir_all(dest_dir)?;
+    for dir in &source_dirs {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let src = entry.path();
+            let dest = dest_dir.join(entry.file_name());
+            if src.is_dir() {
+                copy_dir_recursive(&src, &dest)?;
+            } else {
+                fs::copy(&src, &dest)
+                    .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn cleanup(clone_dir: &Path) -> Result<()> {
     fs::remove_dir_all(clone_dir)
         .with_context(|| format!("Failed to remove {}", clone_dir.display()))?;
     Ok(())
 }
 
-pub fn run_setup(cli: &Cli, clone_dir: &Path, rules_dir: &Path) -> Result<()> {
+// ── Orchestration ────────────────────────────────────────────────────────
+
+pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
     println!("Updating .gitignore...");
     update_gitignore()?;
 
+    println!("Resolving languages...");
+    let resolved_languages = resolve_all_languages(&cli.languages, clone_dir)?;
+
+    println!("Assembling MCP servers...");
+    let (mcp_json, active_mcps) = assemble_mcp_json(&resolved_languages, &cli.mcp, clone_dir)?;
+    fs::write(
+        clone_dir.join(".mcp.json"),
+        serde_json::to_string_pretty(&mcp_json)?,
+    )?;
+
     println!("Rendering CLAUDE.md...");
-    let (claude_md, resolved_languages) = render_claude_md(&cli.languages, &cli.mcp, rules_dir)?;
-    let claude_path = clone_dir.join("CLAUDE.md");
-    fs::write(&claude_path, claude_md)?;
+    let claude_md = render_claude_md(&resolved_languages, &active_mcps, clone_dir)?;
+    fs::write(clone_dir.join("CLAUDE.md"), claude_md)?;
 
-    println!("Configuring hooks: {:?}", cli.hooks);
-    update_settings_with_hooks(&cli.hooks, clone_dir)?;
+    println!("Building settings...");
+    build_settings(&cli.hooks, &active_mcps, clone_dir)?;
 
-    println!("Configuring MCP servers: {:?}", cli.mcp);
-    filter_mcp_json(&cli.mcp, clone_dir)?;
+    println!("Assembling commands...");
+    copy_conditional_dir(
+        &clone_dir.join("commands"),
+        &resolved_languages,
+        &clone_dir.join(".claude/commands"),
+    )?;
+
+    println!("Assembling skills...");
+    copy_conditional_dir(
+        &clone_dir.join("skills"),
+        &resolved_languages,
+        &clone_dir.join(".claude/skills"),
+    )?;
 
     println!("Copying files...");
     copy_files(clone_dir)?;
 
-    copy_lang_files(&resolved_languages, clone_dir)?;
+    println!("Copying language-specific files...");
+    copy_conditional_dir(
+        &clone_dir.join("copied"),
+        &resolved_languages,
+        Path::new("."),
+    )?;
 
     Ok(())
 }

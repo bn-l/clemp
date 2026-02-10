@@ -1,45 +1,61 @@
-//! Tests for filter_mcp_json.
+//! Tests for assemble_mcp_json.
 
 mod common;
 
-use clemp::filter_mcp_json;
+use clemp::assemble_mcp_json;
 use common::Scaffold;
-use serde_json::Value;
 use std::fs;
 
 #[test]
-fn filter_mcp_keeps_requested_servers() {
+fn default_mcps_always_included() {
     let s = Scaffold::new();
-    s.with_mcp(
-        r#"{"mcpServers": {"context7": {"url": "c7"}, "other": {"url": "x"}, "third": {"url": "y"}}}"#,
-    );
+    s.with_default_mcps(&[
+        ("context7", r#"{"context7": {"type": "http", "url": "c7"}}"#),
+        ("textbelt", r#"{"textbelt": {"type": "stdio", "cmd": "tb"}}"#),
+    ]);
 
-    filter_mcp_json(&["context7".into(), "third".into()], s.path()).unwrap();
-
-    let content = fs::read_to_string(s.path().join(".mcp.json")).unwrap();
-    let val: Value = serde_json::from_str(&content).unwrap();
-    let servers = val["mcpServers"].as_object().unwrap();
+    let (json, names) = assemble_mcp_json(&[], &[], s.path()).unwrap();
+    let servers = json["mcpServers"].as_object().unwrap();
     assert_eq!(servers.len(), 2);
     assert!(servers.contains_key("context7"));
-    assert!(servers.contains_key("third"));
-    assert!(!servers.contains_key("other"));
+    assert!(servers.contains_key("textbelt"));
+    assert_eq!(names.len(), 2);
 }
 
 #[test]
-fn filter_mcp_removes_file_when_empty() {
+fn language_mcps_added() {
     let s = Scaffold::new();
-    s.with_mcp(r#"{"mcpServers": {}}"#);
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_lang_mcps("svelte", &[("svelte", r#"{"svelte": {"url": "sv"}}"#)]);
 
-    filter_mcp_json(&[], s.path()).unwrap();
-    assert!(!s.path().join(".mcp.json").exists());
+    let (json, names) = assemble_mcp_json(&["svelte".into()], &[], s.path()).unwrap();
+    let servers = json["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 2);
+    assert!(servers.contains_key("context7"));
+    assert!(servers.contains_key("svelte"));
+    assert!(names.contains(&"svelte".to_string()));
 }
 
 #[test]
-fn filter_mcp_unknown_server_errors() {
+fn named_mcps_added() {
     let s = Scaffold::new();
-    s.with_mcp(r#"{"mcpServers": {"context7": {}}}"#);
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_named_mcps(&[("maps", r#"{"maps": {"url": "maps"}}"#)]);
 
-    let result = filter_mcp_json(&["doesnt-exist".into()], s.path());
+    let (json, names) = assemble_mcp_json(&[], &["maps".into()], s.path()).unwrap();
+    let servers = json["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 2);
+    assert!(servers.contains_key("context7"));
+    assert!(servers.contains_key("maps"));
+    assert!(names.contains(&"maps".to_string()));
+}
+
+#[test]
+fn named_mcp_not_found_errors() {
+    let s = Scaffold::new();
+    s.with_default_mcps(&[("context7", r#"{"context7": {}}"#)]);
+
+    let result = assemble_mcp_json(&[], &["doesnt-exist".into()], s.path());
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("doesnt-exist"));
@@ -47,21 +63,51 @@ fn filter_mcp_unknown_server_errors() {
 }
 
 #[test]
-fn filter_mcp_no_file_is_ok() {
+fn no_mcp_dir_is_ok() {
     let s = Scaffold::new();
-    filter_mcp_json(&["anything".into()], s.path()).unwrap();
+    let (json, names) = assemble_mcp_json(&[], &[], s.path()).unwrap();
+    assert!(json["mcpServers"].as_object().unwrap().is_empty());
+    assert!(names.is_empty());
 }
 
 #[test]
-fn filter_mcp_single_server() {
+fn no_mcp_dir_with_named_mcp_errors() {
     let s = Scaffold::new();
-    s.with_mcp(r#"{"mcpServers": {"context7": {"cmd": "c7"}, "other": {"cmd": "x"}}}"#);
+    let result = assemble_mcp_json(&[], &["maps".into()], s.path());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("--mcp specified"));
+}
 
-    filter_mcp_json(&["context7".into()], s.path()).unwrap();
+#[test]
+fn all_three_sources_merged() {
+    let s = Scaffold::new();
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_lang_mcps("svelte", &[("svelte", r#"{"svelte": {"url": "sv"}}"#)]);
+    s.with_named_mcps(&[("maps", r#"{"maps": {"url": "maps"}}"#)]);
 
-    let content = fs::read_to_string(s.path().join(".mcp.json")).unwrap();
-    let val: Value = serde_json::from_str(&content).unwrap();
-    let servers = val["mcpServers"].as_object().unwrap();
+    let (json, names) =
+        assemble_mcp_json(&["svelte".into()], &["maps".into()], s.path()).unwrap();
+    let servers = json["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 3);
+    assert_eq!(names.len(), 3);
+}
+
+#[test]
+fn missing_lang_dir_silently_skipped() {
+    let s = Scaffold::new();
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+
+    let (json, _) = assemble_mcp_json(&["rust".into()], &[], s.path()).unwrap();
+    let servers = json["mcpServers"].as_object().unwrap();
     assert_eq!(servers.len(), 1);
-    assert!(servers.contains_key("context7"));
+}
+
+#[test]
+fn empty_mcp_json_when_no_servers() {
+    let s = Scaffold::new();
+    fs::create_dir_all(s.path().join("mcp/default")).unwrap();
+
+    let (json, names) = assemble_mcp_json(&[], &[], s.path()).unwrap();
+    assert!(json["mcpServers"].as_object().unwrap().is_empty());
+    assert!(names.is_empty());
 }

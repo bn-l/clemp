@@ -11,7 +11,6 @@ fn main() -> Result<()> {
     cli.hooks = split_multi_values(cli.hooks);
     cli.mcp = split_multi_values(cli.mcp);
     let clone_dir = Path::new(CLONE_DIR);
-    let rules_dir = clone_dir.join("rules-templates");
 
     let repo_url = get_repo_url()?;
 
@@ -20,7 +19,7 @@ fn main() -> Result<()> {
 
     let gitignore_existed = Path::new(".gitignore").exists();
 
-    if let Err(e) = run_setup(&cli, clone_dir, &rules_dir) {
+    if let Err(e) = run_setup(&cli, clone_dir) {
         eprintln!("Removing {} due to error...", clone_dir.display());
         let _ = fs::remove_dir_all(clone_dir);
         if !gitignore_existed {

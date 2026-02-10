@@ -10,7 +10,7 @@ use tempfile::TempDir;
 /// Global mutex to serialize tests that change the process working directory.
 pub static CWD_LOCK: Mutex<()> = Mutex::new(());
 
-/// Scaffolds a fake clone directory with configurable template files.
+/// Scaffolds a fake clone directory matching the v2 template structure.
 pub struct Scaffold {
     pub dir: TempDir,
 }
@@ -26,43 +26,119 @@ impl Scaffold {
         self.dir.path()
     }
 
-    pub fn with_rules_template(&self, template: &str, rules: &[(&str, &str)]) {
-        let rules_dir = self.path().join("rules-templates");
-        fs::create_dir_all(&rules_dir).unwrap();
-        fs::write(rules_dir.join("CLAUDE-template.md"), template).unwrap();
-        for (name, content) in rules {
-            fs::write(rules_dir.join(name), content).unwrap();
+    // ── CLAUDE.md template ───────────────────────────────────────────
+
+    /// Write CLAUDE.md.jinja and optional lang-rules files.
+    pub fn with_template(&self, template: &str, lang_rules: &[(&str, &str)]) {
+        fs::write(self.path().join("CLAUDE.md.jinja"), template).unwrap();
+        if !lang_rules.is_empty() {
+            let dir = self.path().join("claude-md/lang-rules");
+            fs::create_dir_all(&dir).unwrap();
+            for (name, content) in lang_rules {
+                fs::write(dir.join(name), content).unwrap();
+            }
         }
     }
 
-    pub fn with_hooks(&self, hooks: &[(&str, &str)]) {
-        let hooks_dir = self.path().join("hooks-template");
-        fs::create_dir_all(&hooks_dir).unwrap();
-        for (name, content) in hooks {
-            fs::write(hooks_dir.join(format!("{}.json", name)), content).unwrap();
+    /// Write misc files into claude-md/misc/.
+    pub fn with_misc_files(&self, files: &[(&str, &str)]) {
+        let dir = self.path().join("claude-md/misc");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            fs::write(dir.join(name), content).unwrap();
         }
     }
+
+    /// Write MCP rules files into claude-md/mcp-rules/.
+    pub fn with_mcp_rules(&self, files: &[(&str, &str)]) {
+        let dir = self.path().join("claude-md/mcp-rules");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            fs::write(dir.join(name), content).unwrap();
+        }
+    }
+
+    // ── Hooks ────────────────────────────────────────────────────────
+
+    /// Write default and/or named hook files.
+    pub fn with_default_hooks(&self, hooks: &[(&str, &str)]) {
+        let dir = self.path().join("hooks/default");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in hooks {
+            fs::write(dir.join(format!("{}.json", name)), content).unwrap();
+        }
+    }
+
+    pub fn with_named_hooks(&self, hooks: &[(&str, &str)]) {
+        let dir = self.path().join("hooks");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in hooks {
+            fs::write(dir.join(format!("{}.json", name)), content).unwrap();
+        }
+    }
+
+    // ── Settings ─────────────────────────────────────────────────────
 
     pub fn with_settings(&self, content: &str) {
-        let settings_dir = self.path().join(".claude");
-        fs::create_dir_all(&settings_dir).unwrap();
-        fs::write(settings_dir.join("settings.local.json"), content).unwrap();
+        fs::write(self.path().join("settings.local.json"), content).unwrap();
     }
 
-    pub fn with_mcp(&self, content: &str) {
-        fs::write(self.path().join(".mcp.json"), content).unwrap();
+    // ── MCP servers ──────────────────────────────────────────────────
+
+    pub fn with_default_mcps(&self, servers: &[(&str, &str)]) {
+        let dir = self.path().join("mcp/default");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in servers {
+            fs::write(dir.join(format!("{}.json", name)), content).unwrap();
+        }
     }
+
+    pub fn with_lang_mcps(&self, lang: &str, servers: &[(&str, &str)]) {
+        let dir = self.path().join("mcp").join(lang);
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in servers {
+            fs::write(dir.join(format!("{}.json", name)), content).unwrap();
+        }
+    }
+
+    pub fn with_named_mcps(&self, servers: &[(&str, &str)]) {
+        let dir = self.path().join("mcp");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in servers {
+            fs::write(dir.join(format!("{}.json", name)), content).unwrap();
+        }
+    }
+
+    // ── Commands / Skills / Copied ───────────────────────────────────
+
+    pub fn with_commands(&self, subdir: &str, files: &[(&str, &str)]) {
+        let dir = self.path().join("commands").join(subdir);
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            fs::write(dir.join(name), content).unwrap();
+        }
+    }
+
+    pub fn with_skills(&self, subdir: &str, files: &[(&str, &str)]) {
+        let dir = self.path().join("skills").join(subdir);
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            fs::write(dir.join(name), content).unwrap();
+        }
+    }
+
+    pub fn with_copied(&self, subdir: &str, files: &[(&str, &str)]) {
+        let dir = self.path().join("copied").join(subdir);
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            fs::write(dir.join(name), content).unwrap();
+        }
+    }
+
+    // ── Gitignore ────────────────────────────────────────────────────
 
     pub fn with_gitignore_additions(&self, content: &str) {
         fs::write(self.path().join("gitignore-additions"), content).unwrap();
-    }
-
-    pub fn with_lang_files(&self, lang: &str, files: &[(&str, &str)]) {
-        let lang_dir = self.path().join("lang-files").join(lang);
-        fs::create_dir_all(&lang_dir).unwrap();
-        for (name, content) in files {
-            fs::write(lang_dir.join(name), content).unwrap();
-        }
     }
 }
 

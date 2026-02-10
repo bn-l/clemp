@@ -23,7 +23,6 @@ fn split_multi_values_space_separated() {
 
 #[test]
 fn split_multi_values_mixed() {
-    // clap splits on comma first, so we might get ["a", "b c"]
     let input = vec!["a".into(), "b c".into()];
     assert_eq!(split_multi_values(input), vec!["a", "b", "c"]);
 }
@@ -52,7 +51,7 @@ fn split_multi_values_single_value_no_split() {
     assert_eq!(split_multi_values(input), vec!["context7"]);
 }
 
-// ── CLI parsing: space-separated values ─────────────────────────────────
+// ── CLI parsing ─────────────────────────────────────────────────────────
 
 #[test]
 fn cli_mcp_space_separated() {
@@ -87,10 +86,10 @@ fn cli_hooks_comma_separated() {
 }
 
 #[test]
-fn cli_default_values() {
+fn cli_no_flags_gives_empty_vecs() {
     let cli = Cli::try_parse_from(["clemp", "ts"]).unwrap();
-    assert_eq!(cli.hooks, vec!["sound"]);
-    assert_eq!(cli.mcp, vec!["context7"]);
+    assert!(cli.hooks.is_empty());
+    assert!(cli.mcp.is_empty());
 }
 
 #[test]

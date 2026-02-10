@@ -1,73 +1,97 @@
-//! Tests for update_settings_with_hooks.
+//! Tests for build_settings (hooks merging + enabledMcpjsonServers).
 
 mod common;
 
-use clemp::update_settings_with_hooks;
+use clemp::build_settings;
 use common::Scaffold;
 use serde_json::Value;
 use std::fs;
 
 #[test]
-fn hooks_merge_into_settings() {
+fn default_hooks_always_applied() {
     let s = Scaffold::new();
     s.with_settings(r#"{"permissions": {"allow": []}}"#);
-    s.with_hooks(&[
-        ("sound", r#"{"Notification": [{"command": "play-sound"}]}"#),
-        (
-            "lint",
-            r#"{"PreToolUse": [{"command": "lint"}], "Notification": [{"command": "notify-lint"}]}"#,
-        ),
-    ]);
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
 
-    update_settings_with_hooks(&["sound".into(), "lint".into()], s.path()).unwrap();
+    build_settings(&[], &[], s.path()).unwrap();
+
+    let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
+    let val: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(val["hooks"]["Notification"].as_array().unwrap().len(), 1);
+    // permissions preserved
+    assert!(val["permissions"]["allow"].is_array());
+}
+
+#[test]
+fn named_hooks_merged_with_defaults() {
+    let s = Scaffold::new();
+    s.with_settings("{}");
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
+    s.with_named_hooks(&[(
+        "blocker",
+        r#"{"PreToolUse": [{"command": "block"}], "Notification": [{"command": "notify-block"}]}"#,
+    )]);
+
+    build_settings(&["blocker".into()], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
 
-    // permissions preserved
-    assert!(val["permissions"]["allow"].is_array());
-
-    // hooks merged
     let notif = val["hooks"]["Notification"].as_array().unwrap();
-    assert_eq!(notif.len(), 2);
+    assert_eq!(notif.len(), 2); // sound + blocker notification
     let pre = val["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(pre.len(), 1);
 }
 
 #[test]
-fn hooks_missing_file_errors() {
+fn named_hook_not_found_errors() {
     let s = Scaffold::new();
     s.with_settings("{}");
-    s.with_hooks(&[]);
+    fs::create_dir_all(s.path().join("hooks")).unwrap();
 
-    let result = update_settings_with_hooks(&["nonexistent".into()], s.path());
+    let result = build_settings(&["nonexistent".into()], &[], s.path());
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("not found"));
 }
 
 #[test]
-fn hooks_creates_settings_if_absent() {
-    let s = Scaffold::new();
-    fs::create_dir_all(s.path().join(".claude")).unwrap();
-    s.with_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
-
-    update_settings_with_hooks(&["sound".into()], s.path()).unwrap();
-
-    let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
-    let val: Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(val["hooks"]["Notification"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn hooks_empty_list_writes_empty_hooks() {
+fn no_hooks_dir_empty_hooks() {
     let s = Scaffold::new();
     s.with_settings(r#"{"existing": true}"#);
-    s.with_hooks(&[]);
 
-    update_settings_with_hooks(&[], s.path()).unwrap();
+    build_settings(&[], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
     assert!(val["existing"].as_bool().unwrap());
     assert!(val["hooks"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn enabled_mcp_servers_set() {
+    let s = Scaffold::new();
+    s.with_settings("{}");
+
+    build_settings(&[], &["context7".into(), "textbelt".into()], s.path()).unwrap();
+
+    let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
+    let val: Value = serde_json::from_str(&content).unwrap();
+    let servers = val["enabledMcpjsonServers"].as_array().unwrap();
+    assert_eq!(servers.len(), 2);
+    assert_eq!(servers[0], "context7");
+    assert_eq!(servers[1], "textbelt");
+}
+
+#[test]
+fn settings_created_if_no_base_file() {
+    let s = Scaffold::new();
+    // No settings.local.json at root
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
+
+    build_settings(&[], &["ctx7".into()], s.path()).unwrap();
+
+    let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
+    let val: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(val["hooks"]["Notification"].as_array().unwrap().len(), 1);
+    assert_eq!(val["enabledMcpjsonServers"].as_array().unwrap().len(), 1);
 }
