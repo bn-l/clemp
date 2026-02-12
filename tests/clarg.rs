@@ -1,11 +1,12 @@
-//! Tests for clarg integration (setup_clarg + build_settings merging).
+//! Tests for clarg integration (setup_clarg + build_settings merging + default auto-detection).
 
 mod common;
 
-use clemp::{build_settings, setup_clarg};
-use common::Scaffold;
+use clemp::{build_settings, run_setup, setup_clarg, Cli, CLONE_DIR};
+use common::{CwdGuard, Scaffold};
 use serde_json::Value;
 use std::fs;
+use tempfile::TempDir;
 
 #[test]
 fn setup_clarg_copies_yaml_and_returns_hook_entry() {
@@ -121,4 +122,113 @@ fn clarg_yaml_content_preserved_exactly() {
 
     let copied = fs::read_to_string(s.path().join(".claude/clarg-full.yaml")).unwrap();
     assert_eq!(copied, yaml);
+}
+
+// ── default.yaml auto-detection via run_setup ───────────────────────
+
+fn scaffold_for_run_setup(s: &Scaffold) {
+    s.with_template("{{ lang_rules }}", &[("typescript.md", "ts rules")]);
+    s.with_gitignore_additions(".claude/\n");
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+}
+
+#[test]
+fn default_yaml_applied_without_clarg_flag() {
+    let s = Scaffold::new();
+    scaffold_for_run_setup(&s);
+    s.with_clarg_configs(&[("default", "internal_access_only: true\n")]);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec!["ts".into()],
+        hooks: vec![],
+        mcp: vec![],
+        clarg: None,
+    };
+
+    run_setup(&cli, s.path()).unwrap();
+
+    // clarg-default.yaml copied
+    assert!(s.path().join(".claude/clarg-default.yaml").exists());
+
+    // PreToolUse hook registered
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 1);
+    assert_eq!(
+        pre[0]["hooks"][0]["command"].as_str().unwrap(),
+        "clarg .claude/clarg-default.yaml"
+    );
+}
+
+#[test]
+fn explicit_clarg_flag_overrides_default() {
+    let s = Scaffold::new();
+    scaffold_for_run_setup(&s);
+    s.with_clarg_configs(&[
+        ("default", "internal_access_only: true\n"),
+        ("strict", "block_access_to:\n  - '.env'\n"),
+    ]);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec!["ts".into()],
+        hooks: vec![],
+        mcp: vec![],
+        clarg: Some("strict".into()),
+    };
+
+    run_setup(&cli, s.path()).unwrap();
+
+    // Only strict copied, not default
+    assert!(s.path().join(".claude/clarg-strict.yaml").exists());
+    assert!(!s.path().join(".claude/clarg-default.yaml").exists());
+
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 1);
+    assert!(pre[0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains("clarg-strict.yaml"));
+}
+
+#[test]
+fn no_default_yaml_and_no_flag_skips_clarg() {
+    let s = Scaffold::new();
+    scaffold_for_run_setup(&s);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec!["ts".into()],
+        hooks: vec![],
+        mcp: vec![],
+        clarg: None,
+    };
+
+    run_setup(&cli, s.path()).unwrap();
+
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(settings["hooks"]["PreToolUse"].is_null());
 }

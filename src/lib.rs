@@ -789,7 +789,10 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
     let claude_md = render_claude_md(&resolved_languages, &active_mcps, clone_dir)?;
     fs::write(clone_dir.join("CLAUDE.md"), claude_md)?;
 
-    let clarg_entries: Vec<Value> = if let Some(name) = &cli.clarg {
+    let clarg_name = cli.clarg.clone().or_else(|| {
+        clone_dir.join("clarg/default.yaml").exists().then(|| "default".into())
+    });
+    let clarg_entries: Vec<Value> = if let Some(name) = &clarg_name {
         println!("Setting up clarg...");
         vec![setup_clarg(name, clone_dir)?]
     } else {
@@ -799,7 +802,7 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
     println!("Building settings...");
     build_settings(&cli.hooks, &clarg_entries, &active_mcps, clone_dir)?;
 
-    if cli.clarg.is_some() {
+    if clarg_name.is_some() {
         check_clarg_installed();
     }
 
