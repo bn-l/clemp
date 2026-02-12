@@ -424,6 +424,7 @@ fn run_setup_full_flow() {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
+        clarg: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -561,6 +562,7 @@ fn run_setup_with_named_hooks_and_mcps() {
         languages: vec!["ts".into()],
         hooks: vec!["blocker".into()],
         mcp: vec!["maps".into()],
+        clarg: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -621,6 +623,7 @@ fn run_setup_with_lang_conditionals() {
         languages: vec!["svelte".into()],
         hooks: vec![],
         mcp: vec![],
+        clarg: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -673,6 +676,7 @@ fn run_setup_multiple_languages() {
         languages: vec!["ts".into(), "svelte".into()],
         hooks: vec![],
         mcp: vec![],
+        clarg: None,
     };
 
     run_setup(&cli, s.path()).unwrap();

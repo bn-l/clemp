@@ -13,7 +13,7 @@ fn default_hooks_always_applied() {
     s.with_settings(r#"{"permissions": {"allow": []}}"#);
     s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
 
-    build_settings(&[], &[], s.path()).unwrap();
+    build_settings(&[], &[], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
@@ -32,7 +32,7 @@ fn named_hooks_merged_with_defaults() {
         r#"{"PreToolUse": [{"command": "block"}], "Notification": [{"command": "notify-block"}]}"#,
     )]);
 
-    build_settings(&["blocker".into()], &[], s.path()).unwrap();
+    build_settings(&["blocker".into()], &[], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
@@ -49,7 +49,7 @@ fn named_hook_not_found_errors() {
     s.with_settings("{}");
     fs::create_dir_all(s.path().join("hooks")).unwrap();
 
-    let result = build_settings(&["nonexistent".into()], &[], s.path());
+    let result = build_settings(&["nonexistent".into()], &[], &[], s.path());
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("not found"));
 }
@@ -59,7 +59,7 @@ fn no_hooks_dir_empty_hooks() {
     let s = Scaffold::new();
     s.with_settings(r#"{"existing": true}"#);
 
-    build_settings(&[], &[], s.path()).unwrap();
+    build_settings(&[], &[], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
@@ -72,7 +72,7 @@ fn enabled_mcp_servers_set() {
     let s = Scaffold::new();
     s.with_settings("{}");
 
-    build_settings(&[], &["context7".into(), "textbelt".into()], s.path()).unwrap();
+    build_settings(&[], &[], &["context7".into(), "textbelt".into()], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
@@ -88,7 +88,7 @@ fn settings_created_if_no_base_file() {
     // No settings.local.json at root
     s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
 
-    build_settings(&[], &["ctx7".into()], s.path()).unwrap();
+    build_settings(&[], &[], &["ctx7".into()], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();

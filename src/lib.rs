@@ -92,6 +92,10 @@ pub struct Cli {
     /// Extra MCP server names to include (comma or space separated)
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub mcp: Vec<String>,
+
+    /// Clarg config profile to enable (name of a YAML file in the template's clarg/ directory)
+    #[arg(long)]
+    pub clarg: Option<String>,
 }
 
 // ── Language handling ────────────────────────────────────────────────────
@@ -305,6 +309,65 @@ pub fn assemble_mcp_json(
     Ok((mcp_json, names))
 }
 
+// ── Clarg integration ────────────────────────────────────────────────
+
+/// Copy a clarg YAML config from the template and generate a PreToolUse hook entry.
+pub fn setup_clarg(name: &str, clone_dir: &Path) -> Result<Value> {
+    let clarg_dir = clone_dir.join("clarg");
+    let yaml_path = clarg_dir.join(format!("{}.yaml", name));
+
+    if !yaml_path.exists() {
+        let available: Vec<_> = if clarg_dir.is_dir() {
+            fs::read_dir(&clarg_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map_or(false, |ext| ext == "yaml" || ext == "yml")
+                })
+                .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
+                .collect()
+        } else {
+            vec![]
+        };
+        bail!(
+            "Clarg config '{}' not found in {}. Available: {:?}",
+            name,
+            clarg_dir.display(),
+            available
+        );
+    }
+
+    let dest_name = format!("clarg-{}.yaml", name);
+    let claude_dir = clone_dir.join(".claude");
+    fs::create_dir_all(&claude_dir)?;
+    fs::copy(&yaml_path, claude_dir.join(&dest_name))?;
+
+    Ok(serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": format!("clarg .claude/{}", dest_name)
+        }]
+    }))
+}
+
+/// Warn if clarg is not on PATH.
+pub fn check_clarg_installed() {
+    let found = Command::new("which")
+        .arg("clarg")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !found {
+        eprintln!();
+        eprintln!("Warning: 'clarg' is not installed. Clarg hooks will not work until it is.");
+        eprintln!("  Install with: brew install bn-l/tap/clarg");
+        eprintln!("  Or:           cargo install --git https://github.com/bn-l/clarg");
+        eprintln!();
+    }
+}
+
 // ── Settings / hooks ─────────────────────────────────────────────────────
 
 /// Merge hook entries from a JSON file into the accumulated hooks map.
@@ -329,9 +392,10 @@ fn merge_hook_file(path: &Path, dest: &mut Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-/// Build .claude/settings.local.json from base settings + hooks + MCP list.
+/// Build .claude/settings.local.json from base settings + hooks + clarg + MCP list.
 pub fn build_settings(
     named_hooks: &[String],
+    clarg_entries: &[Value],
     active_mcp_names: &[String],
     clone_dir: &Path,
 ) -> Result<()> {
@@ -389,6 +453,16 @@ pub fn build_settings(
             );
         }
         merge_hook_file(&path, &mut merged_hooks)?;
+    }
+
+    // Merge clarg PreToolUse hook entries
+    for entry in clarg_entries {
+        merged_hooks
+            .entry("PreToolUse".to_string())
+            .or_insert_with(|| Value::Array(vec![]))
+            .as_array_mut()
+            .unwrap()
+            .push(entry.clone());
     }
 
     settings_obj.insert("hooks".to_string(), Value::Object(merged_hooks));
@@ -599,6 +673,7 @@ pub fn copy_files(clone_dir: &Path) -> Result<()> {
         "gitignore-additions",
         "CLAUDE.md.jinja",
         "claude-md",
+        "clarg",
         "commands",
         "skills",
         "copied",
@@ -714,8 +789,19 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
     let claude_md = render_claude_md(&resolved_languages, &active_mcps, clone_dir)?;
     fs::write(clone_dir.join("CLAUDE.md"), claude_md)?;
 
+    let clarg_entries: Vec<Value> = if let Some(name) = &cli.clarg {
+        println!("Setting up clarg...");
+        vec![setup_clarg(name, clone_dir)?]
+    } else {
+        vec![]
+    };
+
     println!("Building settings...");
-    build_settings(&cli.hooks, &active_mcps, clone_dir)?;
+    build_settings(&cli.hooks, &clarg_entries, &active_mcps, clone_dir)?;
+
+    if cli.clarg.is_some() {
+        check_clarg_installed();
+    }
 
     println!("Assembling commands...");
     copy_conditional_dir(

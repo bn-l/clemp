@@ -149,3 +149,35 @@ fn cli_hooks_mixed_comma_and_space() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--hooks", "a,b", "c"]).unwrap();
     assert_eq!(cli.hooks, vec!["a", "b", "c"]);
 }
+
+// ── --clarg parsing ─────────────────────────────────────────────────────
+
+#[test]
+fn cli_clarg_single_value() {
+    let cli = Cli::try_parse_from(["clemp", "ts", "--clarg", "strict"]).unwrap();
+    assert_eq!(cli.clarg.as_deref(), Some("strict"));
+}
+
+#[test]
+fn cli_clarg_not_specified() {
+    let cli = Cli::try_parse_from(["clemp", "ts"]).unwrap();
+    assert!(cli.clarg.is_none());
+}
+
+#[test]
+fn cli_clarg_combined_with_other_options() {
+    let cli = Cli::try_parse_from([
+        "clemp",
+        "ts",
+        "--hooks",
+        "sound",
+        "--mcp",
+        "context7",
+        "--clarg",
+        "strict",
+    ])
+    .unwrap();
+    assert_eq!(cli.clarg.as_deref(), Some("strict"));
+    assert_eq!(cli.hooks, vec!["sound"]);
+    assert_eq!(cli.mcp, vec!["context7"]);
+}

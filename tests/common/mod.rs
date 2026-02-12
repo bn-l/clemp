@@ -135,6 +135,16 @@ impl Scaffold {
         }
     }
 
+    // ── Clarg configs ────────────────────────────────────────────────
+
+    pub fn with_clarg_configs(&self, configs: &[(&str, &str)]) {
+        let dir = self.path().join("clarg");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in configs {
+            fs::write(dir.join(format!("{}.yaml", name)), content).unwrap();
+        }
+    }
+
     // ── Gitignore ────────────────────────────────────────────────────
 
     pub fn with_gitignore_additions(&self, content: &str) {
