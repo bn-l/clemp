@@ -46,7 +46,7 @@ clemp ts --clarg strict
 |--------|---------|-------------|
 | `--hooks` | `sound` | Hook names to include (comma-separated) |
 | `--mcp` | `context7` | MCP server names to keep (comma-separated) |
-| `--clarg` | — | Clarg config profile to enable (see below) |
+| `--clarg` | `default` (if present) | Clarg config profile to enable (see below) |
 
 ## Clarg Integration
 
@@ -59,6 +59,7 @@ clemp ts --clarg strict
 ```
 claude-template/
 └── clarg/
+    ├── default.yaml      # Auto-applied when present
     ├── strict.yaml
     └── permissive.yaml
 ```
@@ -75,13 +76,21 @@ commands_forbidden:
 internal_access_only: true
 ```
 
-2. Pass the config name to clemp:
+2. If a `default.yaml` exists in the `clarg/` directory, it is applied automatically — no flag needed:
 
 ```bash
+# default.yaml is applied automatically
+clemp ts
+```
+
+To use a different config instead, pass it explicitly with `--clarg`:
+
+```bash
+# Uses strict.yaml instead of default.yaml
 clemp ts --clarg strict
 ```
 
-This copies `clarg/strict.yaml` to `.claude/clarg-strict.yaml` and registers a `PreToolUse` hook in `.claude/settings.local.json` that runs `clarg .claude/clarg-strict.yaml`.
+This copies the chosen YAML to `.claude/clarg-<name>.yaml` and registers a `PreToolUse` hook in `.claude/settings.local.json` that runs `clarg .claude/clarg-<name>.yaml`.
 
 ### Installing clarg
 
@@ -111,6 +120,7 @@ claude-template/
 │   ├── sound.json
 │   └── ...
 ├── clarg/                        # Optional clarg configs
+│   ├── default.yaml              # Auto-applied if present
 │   └── strict.yaml
 ├── lang-files/                  # Optional language-specific files
 │   ├── typescript/
