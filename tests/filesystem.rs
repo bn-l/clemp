@@ -4,8 +4,9 @@
 mod common;
 
 use clemp::{
-    check_no_conflicts, cleanup, copy_conditional_dir, copy_dir_recursive, copy_files,
-    run_setup, update_gitignore, Cli, CLONE_DIR,
+    check_no_conflicts, cleanup, collect_conditional_dir_sources, collect_copy_files_sources,
+    copy_conditional_dir, copy_dir_recursive, copy_files, run_setup, update_gitignore, Cli,
+    CLONE_DIR,
 };
 use common::{setup_gitignore_test, CwdGuard, Scaffold};
 use serde_json::Value;
@@ -196,21 +197,6 @@ fn copy_files_excludes_reserved_entries() {
     assert!(!workdir.path().join("claude-md").exists());
 }
 
-#[test]
-fn copy_files_errors_on_conflict() {
-    let s = Scaffold::new();
-    fs::write(s.path().join("CLAUDE.md"), "claude").unwrap();
-
-    let workdir = TempDir::new().unwrap();
-    let _g = CwdGuard::new(workdir.path());
-
-    fs::write(workdir.path().join("CLAUDE.md"), "existing").unwrap();
-
-    let result = copy_files(s.path());
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("CLAUDE.md"));
-}
-
 // ── copy_conditional_dir ────────────────────────────────────────────────
 
 #[test]
@@ -291,23 +277,6 @@ fn copy_conditional_missing_source_dir_ok() {
     let dest = TempDir::new().unwrap();
 
     copy_conditional_dir(&s.path().join("commands"), &[], dest.path()).unwrap();
-}
-
-#[test]
-fn copy_conditional_conflict_errors() {
-    let s = Scaffold::new();
-    s.with_copied("default", &[("AGENTS.md", "agents")]);
-
-    let workdir = TempDir::new().unwrap();
-    fs::write(workdir.path().join("AGENTS.md"), "existing").unwrap();
-
-    let result = copy_conditional_dir(
-        &s.path().join("copied"),
-        &[],
-        workdir.path(),
-    );
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("AGENTS.md"));
 }
 
 #[test]
@@ -506,6 +475,137 @@ fn copy_conditional_copied_with_lang_files() {
 
     assert!(dest.path().join("editor.cfg").exists());
     assert!(dest.path().join("swift-lint.yml").exists());
+}
+
+// ── run_setup pre-flight conflict check (no dirty state) ────────────────
+
+#[test]
+fn run_setup_aborts_cleanly_on_copy_files_conflict() {
+    let s = Scaffold::new();
+    s.with_gitignore_additions(".claude/\n");
+    s.with_template("base", &[]);
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_copied("default", &[(".editorconfig", "config")]);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    // Pre-existing CLAUDE.md in CWD — will conflict with copy_files
+    fs::write(workdir.path().join("CLAUDE.md"), "existing").unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec![],
+        hooks: vec![],
+        mcp: vec![],
+        clarg: None,
+    };
+
+    let result = run_setup(&cli, s.path());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("CLAUDE.md"));
+
+    // CWD must be untouched — no .gitignore created, no .mcp.json, no .editorconfig
+    assert!(!workdir.path().join(".gitignore").exists());
+    assert!(!workdir.path().join(".mcp.json").exists());
+    assert!(!workdir.path().join(".editorconfig").exists());
+    assert!(!workdir.path().join(".claude").exists());
+    // Original file still intact
+    assert_eq!(
+        fs::read_to_string(workdir.path().join("CLAUDE.md")).unwrap(),
+        "existing"
+    );
+}
+
+#[test]
+fn run_setup_aborts_cleanly_on_copied_dir_conflict() {
+    let s = Scaffold::new();
+    s.with_gitignore_additions(".claude/\n");
+    s.with_template("base", &[]);
+    s.with_copied("default", &[("AGENTS.md", "agents content")]);
+
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+    std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
+
+    // Pre-existing AGENTS.md — will conflict with copy_conditional_dir(copied/)
+    fs::write(workdir.path().join("AGENTS.md"), "existing").unwrap();
+
+    let cli = Cli {
+        version: (),
+        languages: vec![],
+        hooks: vec![],
+        mcp: vec![],
+        clarg: None,
+    };
+
+    let result = run_setup(&cli, s.path());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("AGENTS.md"));
+
+    // CWD must be untouched — no .gitignore, no CLAUDE.md, no .mcp.json
+    assert!(!workdir.path().join(".gitignore").exists());
+    assert!(!workdir.path().join("CLAUDE.md").exists());
+    assert!(!workdir.path().join(".mcp.json").exists());
+    assert!(!workdir.path().join(".claude").exists());
+    // Original file still intact
+    assert_eq!(
+        fs::read_to_string(workdir.path().join("AGENTS.md")).unwrap(),
+        "existing"
+    );
+}
+
+// ── collect_copy_files_sources / collect_conditional_dir_sources ─────────
+
+#[test]
+fn collect_copy_files_sources_excludes_reserved() {
+    let s = Scaffold::new();
+    fs::create_dir_all(s.path().join(".git")).unwrap();
+    fs::create_dir_all(s.path().join("commands")).unwrap();
+    fs::write(s.path().join("README.md"), "readme").unwrap();
+    fs::write(s.path().join("CLAUDE.md"), "claude").unwrap();
+    fs::write(s.path().join(".mcp.json"), "mcp").unwrap();
+
+    let sources = collect_copy_files_sources(s.path()).unwrap();
+    let names: Vec<_> = sources
+        .iter()
+        .filter_map(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .collect();
+
+    assert!(names.contains(&"CLAUDE.md".to_string()));
+    assert!(names.contains(&".mcp.json".to_string()));
+    assert!(!names.contains(&".git".to_string()));
+    assert!(!names.contains(&"README.md".to_string()));
+    assert!(!names.contains(&"commands".to_string()));
+}
+
+#[test]
+fn collect_conditional_dir_sources_gathers_entries() {
+    let s = Scaffold::new();
+    s.with_copied("default", &[("a.txt", "a"), ("b.txt", "b")]);
+    s.with_copied("swift", &[("c.txt", "c")]);
+
+    let sources =
+        collect_conditional_dir_sources(&s.path().join("copied"), &["swift".into()]);
+    let names: Vec<_> = sources
+        .iter()
+        .filter_map(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .collect();
+
+    assert!(names.contains(&"a.txt".to_string()));
+    assert!(names.contains(&"b.txt".to_string()));
+    assert!(names.contains(&"c.txt".to_string()));
+}
+
+#[test]
+fn collect_conditional_dir_sources_missing_dir_returns_empty() {
+    let s = Scaffold::new();
+    let sources =
+        collect_conditional_dir_sources(&s.path().join("nonexistent"), &["swift".into()]);
+    assert!(sources.is_empty());
 }
 
 // ── check_no_conflicts (dedup) ──────────────────────────────────────────

@@ -1,9 +1,10 @@
-<!-- commit: 2d8531caabf506ef1afd0c0825867c5c85bd25ae -->
+<!-- commit: 030d7594927264903637adcb8a9a069a729e7bc1 -->
 
 ### Quick Reference
-- **Critical Paths**: `run_setup` orchestrates the entire pipeline — language resolution → MCP assembly → template rendering → settings/hooks → file copying. Breaking any step cascades.
+- **Critical Paths**: `run_setup` orchestrates the entire pipeline in 3 phases — (1) clone_dir prep: language resolution → MCP assembly → template rendering → settings/hooks/clarg, (2) pre-flight conflict check against CWD, (3) CWD mutations: gitignore, file copying. All CWD writes are gated behind phase 2 so a conflict aborts cleanly.
 - **Architectural Rules**:
-  - Clone dir entries in the `exclude` list (`copy_files`) must stay in sync with template structure dirs (`commands`, `skills`, `copied`, `hooks`, `mcp`, `clarg`, `claude-md`, etc.)
+  - `COPY_FILES_EXCLUDE` (module-level constant in `src/lib.rs`) must stay in sync with template structure dirs (`commands`, `skills`, `copied`, `hooks`, `mcp`, `clarg`, `claude-md`, etc.)
+  - Conflict checking is centralized in `run_setup` phase 2 via `collect_copy_files_sources` + `collect_conditional_dir_sources` + `check_no_conflicts` — individual copy functions (`copy_files`, `copy_conditional_dir`) do **not** check conflicts themselves
   - Language resolution checks 4 conditional dirs: `commands`, `skills`, `copied`, `mcp` — adding a new conditional dir requires updating `resolve_language`
   - MCP assembly merges 3 layers in order: `default/` → language dirs → `--mcp` named files. Later layers override.
 

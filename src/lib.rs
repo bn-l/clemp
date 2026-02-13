@@ -665,30 +665,66 @@ pub fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn copy_files(clone_dir: &Path) -> Result<()> {
-    let exclude = [
-        ".git",
-        "README.md",
-        ".gitignore",
-        "gitignore-additions",
-        "CLAUDE.md.jinja",
-        "claude-md",
-        "clarg",
-        "commands",
-        "skills",
-        "copied",
-        "hooks",
-        "mcp",
-        "settings.local.json",
-    ];
+const COPY_FILES_EXCLUDE: &[&str] = &[
+    ".git",
+    "README.md",
+    ".gitignore",
+    "gitignore-additions",
+    "CLAUDE.md.jinja",
+    "claude-md",
+    "clarg",
+    "commands",
+    "skills",
+    "copied",
+    "hooks",
+    "mcp",
+    "settings.local.json",
+];
 
-    let sources: Vec<PathBuf> = fs::read_dir(clone_dir)?
+/// Collect the source paths that `copy_files` would copy to CWD.
+pub fn collect_copy_files_sources(clone_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(fs::read_dir(clone_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| !exclude.contains(&e.file_name().to_string_lossy().as_ref()))
+        .filter(|e| !COPY_FILES_EXCLUDE.contains(&e.file_name().to_string_lossy().as_ref()))
         .map(|e| e.path())
-        .collect();
+        .collect())
+}
 
-    check_no_conflicts(&sources, Path::new("."))?;
+/// Collect entries from a conditional dir's default/ + lang/ subdirs.
+pub fn collect_conditional_dir_sources(
+    source_dir: &Path,
+    languages: &[String],
+) -> Vec<PathBuf> {
+    if !source_dir.exists() {
+        return vec![];
+    }
+
+    let mut source_dirs = vec![];
+    let default_dir = source_dir.join("default");
+    if default_dir.is_dir() {
+        source_dirs.push(default_dir);
+    }
+    for lang in languages {
+        let lang_dir = source_dir.join(lang);
+        if lang_dir.is_dir() {
+            source_dirs.push(lang_dir);
+        }
+    }
+
+    source_dirs
+        .iter()
+        .flat_map(|dir| {
+            fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+        })
+        .collect()
+}
+
+pub fn copy_files(clone_dir: &Path) -> Result<()> {
+    let sources = collect_copy_files_sources(clone_dir)?;
 
     for src in &sources {
         let dest = Path::new(".").join(src.file_name().unwrap());
@@ -730,20 +766,6 @@ pub fn copy_conditional_dir(
         return Ok(());
     }
 
-    // Collect all entries for conflict check
-    let all_entries: Vec<PathBuf> = source_dirs
-        .iter()
-        .flat_map(|dir| {
-            fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-        })
-        .collect();
-
-    check_no_conflicts(&all_entries, dest_dir)?;
-
     // Copy (default first, then language dirs — later entries override)
     fs::create_dir_all(dest_dir)?;
     for dir in &source_dirs {
@@ -772,8 +794,7 @@ pub fn cleanup(clone_dir: &Path) -> Result<()> {
 // ── Orchestration ────────────────────────────────────────────────────────
 
 pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
-    println!("Updating .gitignore...");
-    update_gitignore()?;
+    // ── Phase 1: clone_dir prep (no CWD mutations) ──────────────────────
 
     println!("Resolving languages...");
     let resolved_languages = resolve_all_languages(&cli.languages, clone_dir)?;
@@ -819,6 +840,21 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
         &resolved_languages,
         &clone_dir.join(".claude/skills"),
     )?;
+
+    // ── Phase 2: pre-flight conflict check (bail before any CWD writes) ─
+
+    println!("Checking for conflicts...");
+    let mut all_cwd_targets = collect_copy_files_sources(clone_dir)?;
+    all_cwd_targets.extend(collect_conditional_dir_sources(
+        &clone_dir.join("copied"),
+        &resolved_languages,
+    ));
+    check_no_conflicts(&all_cwd_targets, Path::new("."))?;
+
+    // ── Phase 3: CWD mutations (conflicts already cleared) ──────────────
+
+    println!("Updating .gitignore...");
+    update_gitignore()?;
 
     println!("Copying files...");
     copy_files(clone_dir)?;
