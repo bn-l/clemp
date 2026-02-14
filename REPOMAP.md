@@ -1,10 +1,10 @@
-<!-- commit: 030d7594927264903637adcb8a9a069a729e7bc1 -->
+<!-- commit: 190cd57f27cbdeb7470cdf2be9d7e04de8bbaf66 -->
 
 ### Quick Reference
 - **Critical Paths**: `run_setup` orchestrates the entire pipeline in 3 phases — (1) clone_dir prep: language resolution → MCP assembly → template rendering → settings/hooks/clarg, (2) pre-flight conflict check against CWD, (3) CWD mutations: gitignore, file copying. All CWD writes are gated behind phase 2 so a conflict aborts cleanly.
 - **Architectural Rules**:
   - `COPY_FILES_EXCLUDE` (module-level constant in `src/lib.rs`) must stay in sync with template structure dirs (`commands`, `skills`, `copied`, `hooks`, `mcp`, `clarg`, `claude-md`, etc.)
-  - Conflict checking is centralized in `run_setup` phase 2 via `collect_copy_files_sources` + `collect_conditional_dir_sources` + `check_no_conflicts` — individual copy functions (`copy_files`, `copy_conditional_dir`) do **not** check conflicts themselves
+  - Conflict checking is centralized in `run_setup` phase 2 via `collect_copy_files_sources` + `collect_conditional_dir_sources` + `collect_conflicts` — individual copy functions (`copy_files`, `copy_conditional_dir`) do **not** check conflicts themselves. With `--force`, conflicts are shown, user is prompted for confirmation, and conflicting paths are removed before copying.
   - Language resolution checks 4 conditional dirs: `commands`, `skills`, `copied`, `mcp` — adding a new conditional dir requires updating `resolve_language`
   - MCP assembly merges 3 layers in order: `default/` → language dirs → `--mcp` named files. Later layers override.
 
@@ -20,6 +20,7 @@
 - `--hooks <name,...>` — extra hook names (comma or space separated, post-processed by `split_multi_values`)
 - `--mcp <name,...>` — extra MCP server names (comma or space separated, post-processed by `split_multi_values`)
 - `--clarg <name>` — clarg config profile (single value, maps to `clarg/<name>.yaml` in template)
+- `--force` — overwrite existing files/directories (with confirmation prompt)
 - `-v` / `--version` — prints version from `Cargo.toml`
 
 **Template Rendering** (`render_claude_md` in `src/lib.rs`)
@@ -40,6 +41,7 @@
 
 **Clarg Integration** (`setup_clarg` + `check_clarg_installed` in `src/lib.rs`)
 - Source: `clarg/<name>.yaml` in clone dir
+- Auto-apply: `clarg/default.yaml` is used automatically when present and no `--clarg` flag is given
 - Output: `.claude/clarg-<name>.yaml` + `PreToolUse` hook entry merged into settings
 - PATH check: warns with install instructions if `clarg` binary not found
 
@@ -49,7 +51,7 @@
 
 **Filesystem** (`copy_files` in `src/lib.rs`)
 - Copies everything from clone dir root to `.` except the `exclude` list
-- `check_no_conflicts` prevents overwriting existing files
+- `collect_conflicts` detects existing files; `--force` with confirmation prompt allows overwriting
 
 **Config Persistence** (`load_config` / `save_config` in `src/lib.rs`)
 - Path: `~/.config/clemp/clemp.yaml`

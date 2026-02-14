@@ -4,7 +4,7 @@
 mod common;
 
 use clemp::{
-    check_no_conflicts, cleanup, collect_conditional_dir_sources, collect_copy_files_sources,
+    cleanup, collect_conditional_dir_sources, collect_conflicts, collect_copy_files_sources,
     copy_conditional_dir, copy_dir_recursive, copy_files, run_setup, update_gitignore, Cli,
     CLONE_DIR,
 };
@@ -14,28 +14,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-// ── check_no_conflicts ──────────────────────────────────────────────────
+// ── collect_conflicts ────────────────────────────────────────────────────
 
 #[test]
-fn check_no_conflicts_passes_when_clean() {
+fn collect_conflicts_empty_when_clean() {
     let workdir = TempDir::new().unwrap();
     let sources = vec![PathBuf::from("/some/dir/nonexistent_file.txt")];
-    check_no_conflicts(&sources, workdir.path()).unwrap();
+    assert!(collect_conflicts(&sources, workdir.path()).is_empty());
 }
 
 #[test]
-fn check_no_conflicts_errors_on_existing() {
+fn collect_conflicts_finds_existing() {
     let workdir = TempDir::new().unwrap();
     fs::write(workdir.path().join("conflict.txt"), "exists").unwrap();
 
     let sources = vec![PathBuf::from("/some/dir/conflict.txt")];
-    let result = check_no_conflicts(&sources, workdir.path());
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("conflict.txt"));
+    let conflicts = collect_conflicts(&sources, workdir.path());
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].ends_with("conflict.txt"));
 }
 
 #[test]
-fn check_no_conflicts_multiple_conflicts() {
+fn collect_conflicts_multiple() {
     let workdir = TempDir::new().unwrap();
     fs::write(workdir.path().join("a.txt"), "").unwrap();
     fs::write(workdir.path().join("b.txt"), "").unwrap();
@@ -45,12 +45,11 @@ fn check_no_conflicts_multiple_conflicts() {
         PathBuf::from("/dir/b.txt"),
         PathBuf::from("/dir/c.txt"),
     ];
-    let result = check_no_conflicts(&sources, workdir.path());
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("a.txt"));
-    assert!(msg.contains("b.txt"));
-    assert!(!msg.contains("c.txt"));
+    let conflicts = collect_conflicts(&sources, workdir.path());
+    let names: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
+    assert!(names.iter().any(|n| n.contains("a.txt")));
+    assert!(names.iter().any(|n| n.contains("b.txt")));
+    assert!(!names.iter().any(|n| n.contains("c.txt")));
 }
 
 // ── copy_dir_recursive ──────────────────────────────────────────────────
@@ -394,6 +393,7 @@ fn run_setup_full_flow() {
         hooks: vec![],
         mcp: vec![],
         clarg: None,
+        force: false,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -500,6 +500,7 @@ fn run_setup_aborts_cleanly_on_copy_files_conflict() {
         hooks: vec![],
         mcp: vec![],
         clarg: None,
+        force: false,
     };
 
     let result = run_setup(&cli, s.path());
@@ -538,6 +539,7 @@ fn run_setup_aborts_cleanly_on_copied_dir_conflict() {
         hooks: vec![],
         mcp: vec![],
         clarg: None,
+        force: false,
     };
 
     let result = run_setup(&cli, s.path());
@@ -608,10 +610,10 @@ fn collect_conditional_dir_sources_missing_dir_returns_empty() {
     assert!(sources.is_empty());
 }
 
-// ── check_no_conflicts (dedup) ──────────────────────────────────────────
+// ── collect_conflicts (dedup) ────────────────────────────────────────────
 
 #[test]
-fn check_no_conflicts_dedup() {
+fn collect_conflicts_dedup() {
     let workdir = TempDir::new().unwrap();
     fs::write(workdir.path().join("shared.md"), "exists").unwrap();
 
@@ -619,14 +621,8 @@ fn check_no_conflicts_dedup() {
         PathBuf::from("/dir1/shared.md"),
         PathBuf::from("/dir2/shared.md"),
     ];
-    let result = check_no_conflicts(&sources, workdir.path());
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert_eq!(
-        msg.matches("shared.md").count(),
-        1,
-        "should dedup to one mention"
-    );
+    let conflicts = collect_conflicts(&sources, workdir.path());
+    assert_eq!(conflicts.len(), 1, "should dedup to one entry");
 }
 
 // ── run_setup integration (named hooks + MCPs) ──────────────────────────
@@ -663,6 +659,7 @@ fn run_setup_with_named_hooks_and_mcps() {
         hooks: vec!["blocker".into()],
         mcp: vec!["maps".into()],
         clarg: None,
+        force: false,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -724,6 +721,7 @@ fn run_setup_with_lang_conditionals() {
         hooks: vec![],
         mcp: vec![],
         clarg: None,
+        force: false,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -777,6 +775,7 @@ fn run_setup_multiple_languages() {
         hooks: vec![],
         mcp: vec![],
         clarg: None,
+        force: false,
     };
 
     run_setup(&cli, s.path()).unwrap();

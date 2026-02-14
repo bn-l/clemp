@@ -96,6 +96,10 @@ pub struct Cli {
     /// Clarg config profile to enable (name of a YAML file in the template's clarg/ directory)
     #[arg(long)]
     pub clarg: Option<String>,
+
+    /// Overwrite existing files/directories in the working directory
+    #[arg(long)]
+    pub force: bool,
 }
 
 // ── Language handling ────────────────────────────────────────────────────
@@ -627,24 +631,25 @@ pub fn update_gitignore() -> Result<()> {
     Ok(())
 }
 
-pub fn check_no_conflicts(sources: &[PathBuf], dest_dir: &Path) -> Result<()> {
-    let conflicts: Vec<_> = sources
+/// Collect destination paths that already exist and would be overwritten.
+pub fn collect_conflicts(sources: &[PathBuf], dest_dir: &Path) -> Vec<PathBuf> {
+    sources
         .iter()
         .filter_map(|src| src.file_name())
         .map(|name| dest_dir.join(name))
-        .collect::<HashSet<_>>() // deduplicate
+        .collect::<HashSet<_>>()
         .into_iter()
         .filter(|dest| dest.exists())
-        .collect();
+        .collect()
+}
 
-    if !conflicts.is_empty() {
-        let names: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
-        bail!(
-            "The following files/directories already exist and would be overwritten:\n  {}\nRemove them first or run from a clean directory.",
-            names.join("\n  ")
-        );
-    }
-    Ok(())
+/// Prompt the user for confirmation, returns true for y/yes.
+pub fn confirm(message: &str) -> Result<bool> {
+    print!("{} [y/N] ", message);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 pub fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
@@ -849,7 +854,33 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
         &clone_dir.join("copied"),
         &resolved_languages,
     ));
-    check_no_conflicts(&all_cwd_targets, Path::new("."))?;
+    let conflicts = collect_conflicts(&all_cwd_targets, Path::new("."));
+
+    if !conflicts.is_empty() {
+        let names: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
+
+        if !cli.force {
+            bail!(
+                "The following files/directories already exist and would be overwritten:\n  {}\nRemove them first, run from a clean directory, or use --force.",
+                names.join("\n  ")
+            );
+        }
+
+        println!(
+            "The following files/directories will be overwritten:\n  {}",
+            names.join("\n  ")
+        );
+        if !confirm("Proceed?")? {
+            bail!("Aborted.");
+        }
+        for path in &conflicts {
+            if path.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+    }
 
     // ── Phase 3: CWD mutations (conflicts already cleared) ──────────────
 
