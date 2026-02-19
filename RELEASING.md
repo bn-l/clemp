@@ -39,14 +39,14 @@ curl -sL https://github.com/bn-l/clemp/archive/refs/tags/v0.1.5.tar.gz | shasum 
 
 ## 7. Update Homebrew formula
 
-Edit `../clemp-tap/Formula/clemp.rb`:
+Edit `../homebrew-tap/Formula/clemp.rb`:
 - Update `url` to new tag
 - Update `sha256` to value from step 6
 
 ## 8. Push tap update
 
 ```bash
-cd ../clemp-tap
+cd ../homebrew-tap
 git add Formula/clemp.rb && git commit -m "clemp 0.1.5" && git push origin main
 ```
 
