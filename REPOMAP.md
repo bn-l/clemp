@@ -1,7 +1,7 @@
-<!-- commit: 190cd57f27cbdeb7470cdf2be9d7e04de8bbaf66 -->
+<!-- commit: 24452a13b9928e07ecf9f4553b2760825307a091 -->
 
 ### Quick Reference
-- **Critical Paths**: `run_setup` orchestrates the entire pipeline in 3 phases — (1) clone_dir prep: language resolution → MCP assembly → template rendering → settings/hooks/clarg, (2) pre-flight conflict check against CWD, (3) CWD mutations: gitignore, file copying. All CWD writes are gated behind phase 2 so a conflict aborts cleanly.
+- **Critical Paths**: `run_setup` orchestrates the entire pipeline in 3 phases — (1) clone_dir prep: language resolution → MCP assembly → template rendering → settings/hooks/clarg → commands/skills assembly (conditional dirs + named commands), (2) pre-flight conflict check against CWD, (3) CWD mutations: gitignore, file copying. All CWD writes are gated behind phase 2 so a conflict aborts cleanly.
 - **Architectural Rules**:
   - `COPY_FILES_EXCLUDE` (module-level constant in `src/lib.rs`) must stay in sync with template structure dirs (`commands`, `skills`, `copied`, `hooks`, `mcp`, `clarg`, `claude-md`, etc.)
   - Conflict checking is centralized in `run_setup` phase 2 via `collect_copy_files_sources` + `collect_conditional_dir_sources` + `collect_conflicts` — individual copy functions (`copy_files`, `copy_conditional_dir`) do **not** check conflicts themselves. With `--force`, conflicts are shown, user is prompted for confirmation, and conflicting paths are removed before copying.
@@ -19,6 +19,7 @@
 - Positional: `[LANGUAGE...]` — language names/aliases
 - `--hooks <name,...>` — extra hook names (comma or space separated, post-processed by `split_multi_values`)
 - `--mcp <name,...>` — extra MCP server names (comma or space separated, post-processed by `split_multi_values`)
+- `--commands <name,...>` — extra command names (comma or space separated, post-processed by `split_multi_values`)
 - `--clarg <name>` — clarg config profile (single value, maps to `clarg/<name>.yaml` in template)
 - `--force` — overwrite existing files/directories (with confirmation prompt)
 - `-v` / `--version` — prints version from `Cargo.toml`
@@ -49,6 +50,11 @@
 - Pattern: `<source_dir>/default/` + `<source_dir>/<lang>/` → merged into dest (lang overrides default)
 - Applied to: `commands` → `.claude/commands`, `skills` → `.claude/skills`, `copied` → `.` (project root)
 
+**Named Commands** (`copy_named_commands` in `src/lib.rs`)
+- Sources: `commands/<name>.md` — standalone `.md` files at root of commands dir
+- Copied into `.claude/commands/` after conditional dir assembly (named files override defaults/lang with same name)
+- Mirrors the `--mcp` / `--hooks` named-file pattern
+
 **Filesystem** (`copy_files` in `src/lib.rs`)
 - Copies everything from clone dir root to `.` except the `exclude` list
 - `collect_conflicts` detects existing files; `--force` with confirmation prompt allows overwriting
@@ -59,6 +65,7 @@
 
 ### Naming Conventions
 - Hook files: `hooks/default/<name>.json` for always-on, `hooks/<name>.json` for opt-in via `--hooks`
+- Command files: `commands/default/<name>.md` for always-on, `commands/<lang>/<name>.md` for language-matched, `commands/<name>.md` for opt-in via `--commands`
 - MCP files: `mcp/default/<name>.json` for always-on, `mcp/<lang>/<name>.json` for language-matched, `mcp/<name>.json` for opt-in via `--mcp`
 - Language rules: `claude-md/lang-rules/<canonical>.md`
 - MCP rules: `claude-md/mcp-rules/<name>.md`
