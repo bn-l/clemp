@@ -147,6 +147,7 @@ fn default_yaml_applied_without_clarg_flag() {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     };
@@ -187,6 +188,7 @@ fn explicit_clarg_flag_overrides_default() {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: Some("strict".into()),
         force: false,
     };
@@ -223,6 +225,7 @@ fn no_default_yaml_and_no_flag_skips_clarg() {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     };

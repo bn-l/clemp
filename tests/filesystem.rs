@@ -392,6 +392,7 @@ fn run_setup_full_flow() {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     };
@@ -499,6 +500,7 @@ fn run_setup_aborts_cleanly_on_copy_files_conflict() {
         languages: vec![],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     };
@@ -538,6 +540,7 @@ fn run_setup_aborts_cleanly_on_copied_dir_conflict() {
         languages: vec![],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     };
@@ -658,6 +661,7 @@ fn run_setup_with_named_hooks_and_mcps() {
         languages: vec!["ts".into()],
         hooks: vec!["blocker".into()],
         mcp: vec!["maps".into()],
+        commands: vec![],
         clarg: None,
         force: false,
     };
@@ -720,6 +724,7 @@ fn run_setup_with_lang_conditionals() {
         languages: vec!["svelte".into()],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     };
@@ -774,6 +779,7 @@ fn run_setup_multiple_languages() {
         languages: vec!["ts".into(), "svelte".into()],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     };

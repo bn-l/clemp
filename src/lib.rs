@@ -93,6 +93,10 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub mcp: Vec<String>,
 
+    /// Extra command names to include (comma or space separated)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub commands: Vec<String>,
+
     /// Clarg config profile to enable (name of a YAML file in the template's clarg/ directory)
     #[arg(long)]
     pub clarg: Option<String>,
@@ -790,6 +794,45 @@ pub fn copy_conditional_dir(
     Ok(())
 }
 
+/// Copy named command files from commands/<name>.md into .claude/commands/.
+pub fn copy_named_commands(named_commands: &[String], clone_dir: &Path) -> Result<()> {
+    if named_commands.is_empty() {
+        return Ok(());
+    }
+
+    let commands_dir = clone_dir.join("commands");
+    if !commands_dir.exists() {
+        bail!("--commands specified but no commands/ directory in template");
+    }
+
+    let dest_dir = clone_dir.join(".claude/commands");
+    fs::create_dir_all(&dest_dir)?;
+
+    for name in named_commands {
+        let src = commands_dir.join(format!("{}.md", name));
+        if !src.exists() {
+            let available: Vec<_> = fs::read_dir(&commands_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let p = e.path();
+                    p.is_file() && p.extension().map_or(false, |ext| ext == "md")
+                })
+                .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
+                .collect();
+            bail!(
+                "Command '{}' not found in {}. Available: {:?}",
+                name,
+                commands_dir.display(),
+                available
+            );
+        }
+        fs::copy(&src, dest_dir.join(format!("{}.md", name)))
+            .with_context(|| format!("Failed to copy command {}", name))?;
+    }
+
+    Ok(())
+}
+
 pub fn cleanup(clone_dir: &Path) -> Result<()> {
     fs::remove_dir_all(clone_dir)
         .with_context(|| format!("Failed to remove {}", clone_dir.display()))?;
@@ -838,6 +881,7 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
         &resolved_languages,
         &clone_dir.join(".claude/commands"),
     )?;
+    copy_named_commands(&cli.commands, clone_dir)?;
 
     println!("Assembling skills...");
     copy_conditional_dir(

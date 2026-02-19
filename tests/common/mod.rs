@@ -135,6 +135,14 @@ impl Scaffold {
         }
     }
 
+    pub fn with_named_commands(&self, files: &[(&str, &str)]) {
+        let dir = self.path().join("commands");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            fs::write(dir.join(format!("{}.md", name)), content).unwrap();
+        }
+    }
+
     // ── Clarg configs ────────────────────────────────────────────────
 
     pub fn with_clarg_configs(&self, configs: &[(&str, &str)]) {

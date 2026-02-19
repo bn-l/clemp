@@ -64,6 +64,7 @@ fn default_cli() -> Cli {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
+        commands: vec![],
         clarg: None,
         force: false,
     }

@@ -10,6 +10,7 @@ fn main() -> Result<()> {
     let mut cli = Cli::parse();
     cli.hooks = split_multi_values(cli.hooks);
     cli.mcp = split_multi_values(cli.mcp);
+    cli.commands = split_multi_values(cli.commands);
     let clone_dir = Path::new(CLONE_DIR);
 
     let repo_url = get_repo_url()?;
