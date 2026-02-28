@@ -1,4 +1,4 @@
-<!-- commit: 289ba0092be3e26f7b1a282b7fabb330b0f1f7b5 -->
+<!-- commit: 0acfe70b7fbb0e325f7d13f8adb90139edd09e9a -->
 
 ### Quick Reference
 - **Critical Paths**: `run_setup` orchestrates the entire pipeline in 3 phases — (1) clone_dir prep: language resolution → MCP assembly → template rendering → settings/hooks/clarg → commands/skills assembly (conditional dirs + named commands), (2) pre-flight conflict check against CWD + `.git/hooks/`, (3) CWD mutations: gitignore, file copying, git hooks installation. All CWD writes are gated behind phase 2 so a conflict aborts cleanly.
