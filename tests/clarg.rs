@@ -148,8 +148,10 @@ fn default_yaml_applied_without_clarg_flag() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -189,8 +191,10 @@ fn explicit_clarg_flag_overrides_default() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: Some("strict".into()),
         force: false,
+        list: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -226,8 +230,10 @@ fn no_default_yaml_and_no_flag_skips_clarg() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     run_setup(&cli, s.path()).unwrap();

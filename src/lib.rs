@@ -97,6 +97,10 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub commands: Vec<String>,
 
+    /// Git hook scripts to install into .git/hooks/ (comma or space separated)
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub githooks: Vec<String>,
+
     /// Clarg config profile to enable (name of a YAML file in the template's clarg/ directory)
     #[arg(long)]
     pub clarg: Option<String>,
@@ -104,6 +108,10 @@ pub struct Cli {
     /// Overwrite existing files/directories in the working directory
     #[arg(long)]
     pub force: bool,
+
+    /// List available template files for a category (mcp, hooks, commands, githooks, clarg, languages)
+    #[arg(long, num_args = 0..=1, default_missing_value = "all")]
+    pub list: Option<String>,
 }
 
 // ── Language handling ────────────────────────────────────────────────────
@@ -146,7 +154,7 @@ pub fn resolve_language(input: &str, clone_dir: &Path) -> LanguageResolution {
         return LanguageResolution::HasRulesFile(canonical);
     }
 
-    let has_conditional = ["commands", "skills", "copied", "mcp"]
+    let has_conditional = ["commands", "skills", "copied", "mcp", "githooks"]
         .iter()
         .any(|dir| clone_dir.join(dir).join(&canonical).is_dir());
 
@@ -687,6 +695,7 @@ const COPY_FILES_EXCLUDE: &[&str] = &[
     "copied",
     "hooks",
     "mcp",
+    "githooks",
     "settings.local.json",
 ];
 
@@ -794,6 +803,101 @@ pub fn copy_conditional_dir(
     Ok(())
 }
 
+/// Set a file as executable (0o755) on Unix.
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)
+        .with_context(|| format!("Failed to set executable on {}", path.display()))
+}
+
+/// Copy git hooks from source_dir/default/ and source_dir/<lang>/ into dest_dir,
+/// setting each copied file as executable. Like `copy_conditional_dir` but with chmod.
+pub fn copy_conditional_githooks(
+    source_dir: &Path,
+    languages: &[String],
+    dest_dir: &Path,
+) -> Result<()> {
+    if !source_dir.exists() {
+        return Ok(());
+    }
+
+    let mut source_dirs = Vec::new();
+    let default_dir = source_dir.join("default");
+    if default_dir.is_dir() {
+        source_dirs.push(default_dir);
+    }
+    for lang in languages {
+        let lang_dir = source_dir.join(lang);
+        if lang_dir.is_dir() {
+            source_dirs.push(lang_dir);
+        }
+    }
+
+    if source_dirs.is_empty() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(dest_dir)?;
+    for dir in &source_dirs {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let src = entry.path();
+            let dest = dest_dir.join(entry.file_name());
+            fs::copy(&src, &dest)
+                .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
+            #[cfg(unix)]
+            set_executable(&dest)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy named git hook files (extensionless at githooks/ root) into dest_dir, setting executable.
+pub fn copy_named_githooks(
+    named: &[String],
+    clone_dir: &Path,
+    dest_dir: &Path,
+) -> Result<()> {
+    if named.is_empty() {
+        return Ok(());
+    }
+
+    let githooks_dir = clone_dir.join("githooks");
+    if !githooks_dir.exists() {
+        bail!("--githooks specified but no githooks/ directory in template");
+    }
+
+    fs::create_dir_all(dest_dir)?;
+
+    for name in named {
+        let src = githooks_dir.join(name);
+        if !src.is_file() {
+            let available: Vec<_> = fs::read_dir(&githooks_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            bail!(
+                "Git hook '{}' not found in {}. Available: {:?}",
+                name,
+                githooks_dir.display(),
+                available
+            );
+        }
+        let dest = dest_dir.join(name);
+        fs::copy(&src, &dest)
+            .with_context(|| format!("Failed to copy git hook {}", name))?;
+        #[cfg(unix)]
+        set_executable(&dest)?;
+    }
+
+    Ok(())
+}
+
 /// Copy named command files from commands/<name>.md into .claude/commands/.
 pub fn copy_named_commands(named_commands: &[String], clone_dir: &Path) -> Result<()> {
     if named_commands.is_empty() {
@@ -837,6 +941,86 @@ pub fn cleanup(clone_dir: &Path) -> Result<()> {
     fs::remove_dir_all(clone_dir)
         .with_context(|| format!("Failed to remove {}", clone_dir.display()))?;
     Ok(())
+}
+
+// ── Listing ──────────────────────────────────────────────────────────────
+
+const LIST_CATEGORIES: &[&str] = &["mcp", "hooks", "commands", "githooks", "clarg", "languages"];
+
+/// List available named files for a template category.
+pub fn list_category(category: &str, clone_dir: &Path) -> Result<Vec<String>> {
+    let (subdir, extensions): (&str, &[&str]) = match category {
+        "mcp" => ("mcp", &["json"]),
+        "hooks" => ("hooks", &["json"]),
+        "commands" => ("commands", &["md"]),
+        "githooks" => ("githooks", &[]),
+        "clarg" => ("clarg", &["yaml", "yml"]),
+        "languages" => ("claude-md/lang-rules", &["md"]),
+        _ => bail!(
+            "Unknown category '{}'. Valid categories: {}",
+            category,
+            LIST_CATEGORIES.join(", ")
+        ),
+    };
+
+    let dir = clone_dir.join(subdir);
+    if !dir.is_dir() {
+        return Ok(vec![]);
+    }
+
+    let mut names: Vec<String> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            if extensions.is_empty() {
+                Some(e.file_name().to_string_lossy().into_owned())
+            } else {
+                let path = e.path();
+                let ext = path.extension()?.to_str()?;
+                extensions
+                    .contains(&ext)
+                    .then(|| path.file_stem().unwrap().to_string_lossy().into_owned())
+            }
+        })
+        .collect();
+
+    names.sort();
+    Ok(names)
+}
+
+/// Format available template files for display. "all" lists every category with headers;
+/// a specific category lists just its names.
+pub fn list_available(category: &str, clone_dir: &Path) -> Result<String> {
+    let mut output = String::new();
+
+    if category == "all" {
+        let mut first = true;
+        for &cat in LIST_CATEGORIES {
+            let names = list_category(cat, clone_dir)?;
+            if names.is_empty() {
+                continue;
+            }
+            if !first {
+                output.push('\n');
+            }
+            first = false;
+            output.push_str(cat);
+            output.push_str(":\n");
+            for name in &names {
+                output.push_str("  ");
+                output.push_str(name);
+                output.push('\n');
+            }
+        }
+    } else {
+        let names = list_category(category, clone_dir)?;
+        for name in &names {
+            output.push_str(name);
+            output.push('\n');
+        }
+    }
+
+    Ok(output)
 }
 
 // ── Orchestration ────────────────────────────────────────────────────────
@@ -898,7 +1082,21 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
         &clone_dir.join("copied"),
         &resolved_languages,
     ));
-    let conflicts = collect_conflicts(&all_cwd_targets, Path::new("."));
+    let mut conflicts = collect_conflicts(&all_cwd_targets, Path::new("."));
+
+    // Git hooks conflict check
+    let githooks_dir = clone_dir.join("githooks");
+    let git_hooks_dest = Path::new(".git/hooks");
+    let mut githooks_sources = collect_conditional_dir_sources(&githooks_dir, &resolved_languages);
+    for name in &cli.githooks {
+        let src = githooks_dir.join(name);
+        if src.is_file() {
+            githooks_sources.push(src);
+        }
+    }
+    if git_hooks_dest.is_dir() {
+        conflicts.extend(collect_conflicts(&githooks_sources, git_hooks_dest));
+    }
 
     if !conflicts.is_empty() {
         let names: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
@@ -940,6 +1138,17 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
         &resolved_languages,
         Path::new("."),
     )?;
+
+    // Install git hooks
+    if Path::new(".git").is_dir() {
+        if githooks_dir.exists() || !cli.githooks.is_empty() {
+            println!("Installing git hooks...");
+            copy_conditional_githooks(&githooks_dir, &resolved_languages, git_hooks_dest)?;
+            copy_named_githooks(&cli.githooks, clone_dir, git_hooks_dest)?;
+        }
+    } else if !cli.githooks.is_empty() || githooks_dir.join("default").is_dir() {
+        eprintln!("Warning: No .git/ directory found, skipping git hooks installation");
+    }
 
     Ok(())
 }

@@ -65,8 +65,10 @@ fn default_cli() -> Cli {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     }
 }
 

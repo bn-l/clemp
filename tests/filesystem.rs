@@ -158,6 +158,7 @@ fn copy_files_excludes_reserved_entries() {
     fs::create_dir_all(s.path().join("copied")).unwrap();
     fs::create_dir_all(s.path().join("hooks")).unwrap();
     fs::create_dir_all(s.path().join("mcp")).unwrap();
+    fs::create_dir_all(s.path().join("githooks")).unwrap();
     fs::create_dir_all(s.path().join("claude-md")).unwrap();
     fs::write(s.path().join("README.md"), "readme").unwrap();
     fs::write(s.path().join(".gitignore"), "ignore").unwrap();
@@ -193,6 +194,7 @@ fn copy_files_excludes_reserved_entries() {
     assert!(!workdir.path().join("copied").exists());
     assert!(!workdir.path().join("hooks").exists());
     assert!(!workdir.path().join("mcp").exists());
+    assert!(!workdir.path().join("githooks").exists());
     assert!(!workdir.path().join("claude-md").exists());
 }
 
@@ -393,8 +395,10 @@ fn run_setup_full_flow() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -501,8 +505,10 @@ fn run_setup_aborts_cleanly_on_copy_files_conflict() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     let result = run_setup(&cli, s.path());
@@ -541,8 +547,10 @@ fn run_setup_aborts_cleanly_on_copied_dir_conflict() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     let result = run_setup(&cli, s.path());
@@ -662,8 +670,10 @@ fn run_setup_with_named_hooks_and_mcps() {
         hooks: vec!["blocker".into()],
         mcp: vec!["maps".into()],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -725,8 +735,10 @@ fn run_setup_with_lang_conditionals() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
@@ -780,8 +792,10 @@ fn run_setup_multiple_languages() {
         hooks: vec![],
         mcp: vec![],
         commands: vec![],
+        githooks: vec![],
         clarg: None,
         force: false,
+        list: None,
     };
 
     run_setup(&cli, s.path()).unwrap();
