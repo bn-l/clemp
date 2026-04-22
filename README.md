@@ -172,7 +172,9 @@ Your `claude-template` repo should contain:
 claude-template/
 ├── CLAUDE.md.jinja               # MiniJinja template
 ├── .mcp.json                     # optional
-├── gitignore-additions           # lines appended to project .gitignore
+├── gitignore-additions/          # lines appended to project .gitignore
+│   ├── default.gitignore         # always applied
+│   └── typescript.gitignore      # applied when `ts` / `typescript` resolves (canonical name)
 ├── settings.local.json           # base settings merged by clemp
 ├── claude-md/
 │   ├── lang-rules/
