@@ -235,6 +235,131 @@ fn no_gitignore_created_on_conflict() {
 }
 
 #[test]
+fn e2e_gitignore_applies_default_plus_lang() {
+    let s = full_scaffold();
+    s.with_gitignore_for_lang("typescript", "*.tsbuildinfo\n");
+    let (workdir, _g) = setup_workdir(&s);
+
+    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
+
+    let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains(".claude/"), "default applied:\n{gitignore}");
+    assert!(
+        gitignore.contains("*.tsbuildinfo"),
+        "ts lang fragment applied:\n{gitignore}"
+    );
+}
+
+#[test]
+fn e2e_gitignore_lang_only_no_default_file() {
+    let s = Scaffold::new();
+    // Everything except default.gitignore
+    s.with_template(
+        "{% if lang %}{{ lang_rules }}{% endif %}",
+        &[("typescript.md", "ts rules")],
+    );
+    s.with_settings(r#"{"permissions": {"allow": []}}"#);
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_gitignore_for_lang("typescript", "*.tsbuildinfo\n");
+    let (workdir, _g) = setup_workdir(&s);
+
+    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
+
+    let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(
+        gitignore.contains("*.tsbuildinfo"),
+        "lang-only fragment applied:\n{gitignore}"
+    );
+}
+
+#[test]
+fn e2e_gitignore_dir_excluded_from_copy() {
+    let s = full_scaffold();
+    s.with_gitignore_for_lang("typescript", "*.tsbuildinfo\n");
+    let (workdir, _g) = setup_workdir(&s);
+
+    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
+
+    // The gitignore-additions directory must not be copied into CWD.
+    assert!(
+        !workdir.path().join("gitignore-additions").exists(),
+        "gitignore-additions dir leaked into CWD"
+    );
+}
+
+#[test]
+fn e2e_gitignore_alias_resolves_to_canonical_fragment() {
+    // Passing `js` must read `javascript.gitignore` (the canonical name).
+    // A `js.gitignore` file must NOT be picked up by the alias.
+    let s = Scaffold::new();
+    s.with_template(
+        "{% if lang %}{{ lang_rules }}{% endif %}",
+        &[("javascript.md", "js rules")],
+    );
+    s.with_settings(r#"{"permissions": {"allow": []}}"#);
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    s.with_gitignore_additions(".claude/\n");
+    s.with_gitignore_for_lang("javascript", "node_modules/\ndist/\n");
+    // A stray alias-named file that MUST be ignored.
+    s.with_gitignore_for_lang("js", "SHOULD_NOT_APPEAR/\n");
+
+    let (workdir, _g) = setup_workdir(&s);
+
+    let args = SetupArgs {
+        languages: vec!["js".into()],
+        hooks: vec![],
+        mcp: vec![],
+        commands: vec![],
+        githooks: vec![],
+        clarg: None,
+        force: false,
+    };
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+
+    let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains(".claude/"), "{gitignore}");
+    assert!(gitignore.contains("node_modules/"), "{gitignore}");
+    assert!(gitignore.contains("dist/"), "{gitignore}");
+    assert!(
+        !gitignore.contains("SHOULD_NOT_APPEAR"),
+        "alias filename must not be read:\n{gitignore}"
+    );
+}
+
+#[test]
+fn e2e_gitignore_only_lang_resolves() {
+    let s = Scaffold::new();
+    s.with_template(
+        "{% if lang %}{{ lang_rules }}{% endif %}",
+        &[("typescript.md", "ts rules")],
+    );
+    s.with_settings(r#"{"permissions": {"allow": []}}"#);
+    s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
+    s.with_default_mcps(&[("context7", r#"{"context7": {"url": "c7"}}"#)]);
+    // Language "ziglang" has ONLY a gitignore fragment — no rules, no commands, no skills.
+    s.with_gitignore_for_lang("ziglang", "zig-cache/\nzig-out/\n");
+    let (workdir, _g) = setup_workdir(&s);
+
+    let args = SetupArgs {
+        languages: vec!["ziglang".into()],
+        hooks: vec![],
+        mcp: vec![],
+        commands: vec![],
+        githooks: vec![],
+        clarg: None,
+        force: false,
+    };
+
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+
+    let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains("zig-cache/"), "{gitignore}");
+    assert!(gitignore.contains("zig-out/"), "{gitignore}");
+}
+
+#[test]
 fn second_run_after_success_aborts_cleanly() {
     let s = full_scaffold();
     let (workdir, _g) = setup_workdir(&s);

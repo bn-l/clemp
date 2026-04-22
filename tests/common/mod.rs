@@ -155,8 +155,18 @@ impl Scaffold {
 
     // ── Gitignore ────────────────────────────────────────────────────
 
+    /// Write the always-on fragment at `gitignore-additions/default.gitignore`.
     pub fn with_gitignore_additions(&self, content: &str) {
-        fs::write(self.path().join("gitignore-additions"), content).unwrap();
+        let dir = self.path().join("gitignore-additions");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("default.gitignore"), content).unwrap();
+    }
+
+    /// Write a per-language fragment at `gitignore-additions/<lang>.gitignore`.
+    pub fn with_gitignore_for_lang(&self, lang: &str, content: &str) {
+        let dir = self.path().join("gitignore-additions");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{}.gitignore", lang)), content).unwrap();
     }
 }
 
@@ -181,13 +191,34 @@ impl Drop for CwdGuard {
     }
 }
 
-/// Sets up a temp workdir with a fake CLONE_DIR containing gitignore-additions.
+/// Sets up a temp workdir with a fake CLONE_DIR containing a
+/// `gitignore-additions/default.gitignore` fragment.
 pub fn setup_gitignore_test(existing: Option<&str>, additions: &str) -> (TempDir, CwdGuard) {
+    setup_gitignore_test_with_langs(existing, Some(additions), &[])
+}
+
+/// Full-control variant: optionally seed a default fragment and any number of
+/// per-language fragments inside `CLONE_DIR/gitignore-additions/`.
+pub fn setup_gitignore_test_with_langs(
+    existing: Option<&str>,
+    default: Option<&str>,
+    lang_fragments: &[(&str, &str)],
+) -> (TempDir, CwdGuard) {
     let workdir = TempDir::new().unwrap();
 
-    let clone = workdir.path().join(CLONE_DIR);
-    fs::create_dir_all(&clone).unwrap();
-    fs::write(clone.join("gitignore-additions"), additions).unwrap();
+    let additions_dir = workdir.path().join(CLONE_DIR).join("gitignore-additions");
+    fs::create_dir_all(&additions_dir).unwrap();
+
+    if let Some(content) = default {
+        fs::write(additions_dir.join("default.gitignore"), content).unwrap();
+    }
+    for (lang, content) in lang_fragments {
+        fs::write(
+            additions_dir.join(format!("{}.gitignore", lang)),
+            content,
+        )
+        .unwrap();
+    }
 
     if let Some(content) = existing {
         fs::write(workdir.path().join(".gitignore"), content).unwrap();

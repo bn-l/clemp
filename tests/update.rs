@@ -755,3 +755,90 @@ fn directory_to_file_transition_requires_force_and_replaces_dir() {
     assert!(Path::new("tool.sh").is_file(), "tool.sh should now be a file");
     assert!(fs::read_to_string("tool.sh").unwrap().contains("v2"));
 }
+
+// ── Gitignore behavior across updates ───────────────────────────────────
+
+#[test]
+fn update_reapplies_gitignore_when_only_fragment_changed() {
+    // `.gitignore` is not manifest-tracked, so a template-only change to a
+    // gitignore fragment slips past the classify_update_path machinery. The
+    // explicit re-apply in run_update must still pick it up.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        // v1: default fragment contains `.claude/` only.
+        setup_and_lock(&v1, V1_SHA);
+    }
+
+    let pre = fs::read_to_string(".gitignore").unwrap();
+    assert!(pre.contains(".claude/"));
+    assert!(!pre.contains(".DS_Store"));
+
+    // v2: default fragment grew — nothing else changed shape-wise.
+    let v2 = build_scaffold("v1 ts rules\n");
+    // Overwrite the default fragment written by build_scaffold.
+    fs::write(
+        v2.path().join("gitignore-additions/default.gitignore"),
+        ".claude/\n.DS_Store\n",
+    )
+    .unwrap();
+
+    run_update(&ts_update(false, false, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let post = fs::read_to_string(".gitignore").unwrap();
+    assert!(post.contains(".claude/"), "default line preserved:\n{post}");
+    assert!(
+        post.contains(".DS_Store"),
+        "new fragment line must be appended on update:\n{post}"
+    );
+    // Idempotent — second update adds nothing new.
+    run_update(&ts_update(false, false, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+    let post2 = fs::read_to_string(".gitignore").unwrap();
+    assert_eq!(post, post2, "second update must be a no-op for .gitignore");
+}
+
+#[test]
+fn update_adds_language_with_only_gitignore_fragment() {
+    // User updates with a new language whose only template surface is a
+    // gitignore fragment. resolve_language must accept it (ConditionalOnly via
+    // gitignore fragment) and the new fragment lines must land in .gitignore.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        setup_and_lock(&v1, V1_SHA);
+    }
+
+    // v2: adds a `python.gitignore` fragment. No rules file, no commands dir,
+    // no MCP — python's sole surface is this fragment.
+    let v2 = build_scaffold("v1 ts rules\n");
+    fs::write(
+        v2.path().join("gitignore-additions/python.gitignore"),
+        "__pycache__/\n*.pyc\n",
+    )
+    .unwrap();
+
+    // Update invocation adds `python` to the stored languages.
+    let update = UpdateArgs {
+        setup: SetupArgs {
+            languages: vec!["python".into()],
+            ..Default::default()
+        },
+        prune_stale: false,
+        restore_deleted: false,
+    };
+    run_update(&update, v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let post = fs::read_to_string(".gitignore").unwrap();
+    assert!(post.contains("__pycache__/"), "{post}");
+    assert!(post.contains("*.pyc"), "{post}");
+
+    // Lockfile should now record both languages (additive merge).
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    let langs = &lock.original_command.languages;
+    assert!(langs.iter().any(|l| l == "ts"), "ts kept: {langs:?}");
+    assert!(langs.iter().any(|l| l == "python"), "python added: {langs:?}");
+}

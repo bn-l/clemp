@@ -8,7 +8,7 @@ use clemp::{
     copy_conditional_dir, copy_dir_recursive, copy_files, run_setup, update_gitignore, SetupArgs,
     CLONE_DIR,
 };
-use common::{setup_gitignore_test, CwdGuard, Scaffold};
+use common::{setup_gitignore_test, setup_gitignore_test_with_langs, CwdGuard, Scaffold};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,7 +87,7 @@ fn copy_dir_recursive_empty_dir() {
 fn gitignore_creates_new_file() {
     let (workdir, _g) = setup_gitignore_test(None, ".claude/\n.clinerules\n");
 
-    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &[]).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.contains("# Claude related"));
@@ -99,7 +99,7 @@ fn gitignore_creates_new_file() {
 fn gitignore_appends_to_existing() {
     let (workdir, _g) = setup_gitignore_test(Some("node_modules/\n"), ".claude/\nnode_modules/\n");
 
-    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &[]).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.starts_with("node_modules/\n"));
@@ -116,7 +116,7 @@ fn gitignore_no_op_when_all_present() {
     let (workdir, _g) =
         setup_gitignore_test(Some(".claude/\n.clinerules\n"), ".claude/\n.clinerules\n");
 
-    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &[]).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(!content.contains("# Claude related"));
@@ -126,7 +126,7 @@ fn gitignore_no_op_when_all_present() {
 fn gitignore_handles_whitespace_in_additions() {
     let (workdir, _g) = setup_gitignore_test(None, "  .claude/  \n  \n.foo\n");
 
-    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &[]).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.contains(".claude/"));
@@ -140,10 +140,316 @@ fn gitignore_appends_newline_if_missing() {
         ".claude/\n",
     );
 
-    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &[]).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.contains("node_modules/\n\n# Claude related"));
+}
+
+// ── update_gitignore: language-conditional fragments ────────────────────
+
+#[test]
+fn gitignore_default_only_applied_when_no_langs() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        Some(".claude/\n"),
+        &[("js", "node_modules/\n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &[]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains(".claude/"));
+    assert!(!content.contains("node_modules/"));
+}
+
+#[test]
+fn gitignore_lang_fragment_applied_when_lang_passed() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        Some(".claude/\n"),
+        &[("js", "node_modules/\ndist/\n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains(".claude/"));
+    assert!(content.contains("node_modules/"));
+    assert!(content.contains("dist/"));
+}
+
+#[test]
+fn gitignore_lang_fragment_skipped_when_lang_not_passed() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        Some(".claude/\n"),
+        &[
+            ("js", "node_modules/\n"),
+            ("python", "__pycache__/\n"),
+        ],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["python".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains(".claude/"));
+    assert!(content.contains("__pycache__/"));
+    assert!(!content.contains("node_modules/"));
+}
+
+#[test]
+fn gitignore_multiple_langs_merged_in_order() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        Some(".claude/\n"),
+        &[("js", "node_modules/\n"), ("python", "__pycache__/\n")],
+    );
+
+    update_gitignore(
+        Path::new(CLONE_DIR),
+        Path::new("."),
+        &["js".into(), "python".into()],
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    let claude_pos = content.find(".claude/").unwrap();
+    let js_pos = content.find("node_modules/").unwrap();
+    let py_pos = content.find("__pycache__/").unwrap();
+    assert!(claude_pos < js_pos);
+    assert!(js_pos < py_pos);
+}
+
+#[test]
+fn gitignore_default_and_lang_dedupe() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        Some(".DS_Store\n.claude/\n"),
+        &[("js", ".DS_Store\nnode_modules/\n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert_eq!(content.matches(".DS_Store").count(), 1);
+    assert!(content.contains(".claude/"));
+    assert!(content.contains("node_modules/"));
+}
+
+#[test]
+fn gitignore_existing_and_fragment_dedupe_no_header() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        Some("node_modules/\n"),
+        None,
+        &[("js", "node_modules/\n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(!content.contains("# Claude related"));
+    assert_eq!(content.matches("node_modules/").count(), 1);
+}
+
+#[test]
+fn gitignore_missing_default_file_ok() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        None,
+        &[("js", "node_modules/\n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains("node_modules/"));
+}
+
+#[test]
+fn gitignore_missing_lang_file_is_noop() {
+    let (workdir, _g) =
+        setup_gitignore_test_with_langs(None, Some(".claude/\n"), &[]);
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains(".claude/"));
+    assert!(!content.contains("node_modules/"));
+}
+
+#[test]
+fn gitignore_empty_dir_is_noop() {
+    let workdir = TempDir::new().unwrap();
+    let clone = workdir.path().join(CLONE_DIR);
+    fs::create_dir_all(clone.join("gitignore-additions")).unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    assert!(!workdir.path().join(".gitignore").exists());
+}
+
+#[test]
+fn gitignore_missing_dir_is_noop() {
+    let workdir = TempDir::new().unwrap();
+    let clone = workdir.path().join(CLONE_DIR);
+    fs::create_dir_all(&clone).unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    assert!(!workdir.path().join(".gitignore").exists());
+}
+
+#[test]
+fn gitignore_whitespace_trimmed_across_fragments() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        Some("  .claude/  \n"),
+        &[("js", "   node_modules/   \n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains("\n.claude/\n"));
+    assert!(content.contains("\nnode_modules/\n"));
+}
+
+#[test]
+fn gitignore_blank_lines_skipped_across_fragments() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        Some(".claude/\n\n\n"),
+        &[("javascript", "\n\nnode_modules/\n\n")],
+    );
+
+    update_gitignore(
+        Path::new(CLONE_DIR),
+        Path::new("."),
+        &["javascript".into()],
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    // The Claude-related block must be exactly default → lang, one per line,
+    // with no pass-through blank lines from the fragments.
+    assert_eq!(
+        content,
+        "\n# Claude related\n.claude/\nnode_modules/\n"
+    );
+}
+
+#[test]
+fn gitignore_all_present_no_op() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        Some(".claude/\nnode_modules/\n"),
+        Some(".claude/\n"),
+        &[("js", "node_modules/\n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(!content.contains("# Claude related"));
+    assert_eq!(content, ".claude/\nnode_modules/\n");
+}
+
+#[test]
+fn gitignore_reads_file_by_exact_lang_string() {
+    // `update_gitignore` is a leaf function: it takes the already-canonicalized
+    // language list from `resolve_all_languages` and reads files by that exact
+    // string — no further normalization. Alias→canonical resolution is covered
+    // end-to-end in `e2e_gitignore_alias_resolves_to_canonical_fragment`.
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        None,
+        &[("typescript", "*.tsbuildinfo\n")],
+    );
+
+    update_gitignore(
+        Path::new(CLONE_DIR),
+        Path::new("."),
+        &["typescript".into()],
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains("*.tsbuildinfo"));
+}
+
+#[test]
+fn gitignore_order_preserves_user_lang_order() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        None,
+        &[("js", "node_modules/\n"), ("python", "__pycache__/\n")],
+    );
+
+    update_gitignore(
+        Path::new(CLONE_DIR),
+        Path::new("."),
+        &["python".into(), "js".into()],
+    )
+    .unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    let py_pos = content.find("__pycache__/").unwrap();
+    let js_pos = content.find("node_modules/").unwrap();
+    assert!(py_pos < js_pos, "python should appear before js in output");
+}
+
+#[test]
+fn gitignore_fragment_with_comments_preserved() {
+    let (workdir, _g) = setup_gitignore_test_with_langs(
+        None,
+        None,
+        &[("js", "# node\nnode_modules/\n")],
+    );
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert_eq!(content.matches("# node").count(), 1);
+    assert!(content.contains("node_modules/"));
+}
+
+#[test]
+fn gitignore_lang_file_with_wrong_extension_ignored() {
+    let workdir = TempDir::new().unwrap();
+    let additions = workdir.path().join(CLONE_DIR).join("gitignore-additions");
+    fs::create_dir_all(&additions).unwrap();
+    // Wrong extension — must not be read.
+    fs::write(additions.join("js.txt"), "node_modules/\n").unwrap();
+    fs::write(additions.join("default.gitignore"), ".claude/\n").unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains(".claude/"));
+    assert!(!content.contains("node_modules/"));
+}
+
+#[test]
+fn gitignore_subdirectory_ignored() {
+    let workdir = TempDir::new().unwrap();
+    let additions = workdir.path().join(CLONE_DIR).join("gitignore-additions");
+    fs::create_dir_all(additions.join("subdir")).unwrap();
+    fs::write(
+        additions.join("subdir").join("js.gitignore"),
+        "node_modules/\n",
+    )
+    .unwrap();
+    fs::write(additions.join("default.gitignore"), ".claude/\n").unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    update_gitignore(Path::new(CLONE_DIR), Path::new("."), &["js".into()]).unwrap();
+
+    let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
+    assert!(content.contains(".claude/"));
+    assert!(!content.contains("node_modules/"));
 }
 
 // ── copy_files ──────────────────────────────────────────────────────────
@@ -162,7 +468,12 @@ fn copy_files_excludes_reserved_entries() {
     fs::create_dir_all(s.path().join("claude-md")).unwrap();
     fs::write(s.path().join("README.md"), "readme").unwrap();
     fs::write(s.path().join(".gitignore"), "ignore").unwrap();
-    fs::write(s.path().join("gitignore-additions"), "additions").unwrap();
+    fs::create_dir_all(s.path().join("gitignore-additions")).unwrap();
+    fs::write(
+        s.path().join("gitignore-additions/default.gitignore"),
+        "additions",
+    )
+    .unwrap();
     fs::write(s.path().join("CLAUDE.md.jinja"), "template").unwrap();
     fs::write(s.path().join("settings.local.json"), "settings").unwrap();
 

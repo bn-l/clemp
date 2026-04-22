@@ -132,7 +132,7 @@ pub enum CliCommand {
     Update(UpdateArgs),
 
     /// List available template files for a category
-    /// (mcp, hooks, commands, githooks, clarg, languages)
+    /// (mcp, hooks, commands, githooks, clarg, gitignore, languages)
     List {
         /// Category to list; omit to list every category
         category: Option<String>,
@@ -344,14 +344,26 @@ pub fn resolve_language(input: &str, clone_dir: &Path) -> LanguageResolution {
         return LanguageResolution::HasRulesFile(canonical);
     }
 
-    let has_conditional = ["commands", "skills", "copied", "mcp", "githooks"]
+    let has_conditional_dir = ["commands", "skills", "copied", "mcp", "githooks"]
         .iter()
         .any(|dir| clone_dir.join(dir).join(&canonical).is_dir());
 
-    if has_conditional {
+    let has_gitignore_fragment = clone_dir
+        .join("gitignore-additions")
+        .join(format!("{}.gitignore", canonical))
+        .is_file();
+
+    if has_conditional_dir || has_gitignore_fragment {
+        let surface = if has_conditional_dir && has_gitignore_fragment {
+            "conditional directories and a gitignore fragment"
+        } else if has_conditional_dir {
+            "conditional directories"
+        } else {
+            "a gitignore fragment"
+        };
         eprintln!(
-            "Warning: No rules file for '{}', but has conditional directories for it",
-            canonical
+            "Warning: No rules file for '{}', but has {} for it",
+            canonical, surface
         );
         LanguageResolution::ConditionalOnly(canonical)
     } else {
@@ -812,15 +824,46 @@ pub fn clone_repo(repo_url: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-/// Append the template's `gitignore-additions` lines to `<dest_dir>/.gitignore`,
-/// skipping any lines already present. Idempotent.
-pub fn update_gitignore(clone_dir: &Path, dest_dir: &Path) -> Result<()> {
-    let additions_path = clone_dir.join("gitignore-additions");
-    if !additions_path.exists() {
+/// Append template gitignore fragments to `<dest_dir>/.gitignore`, skipping any
+/// lines already present. Idempotent.
+///
+/// Sources, merged in order:
+///   1. `<clone_dir>/gitignore-additions/default.gitignore` (always applied if present)
+///   2. `<clone_dir>/gitignore-additions/<lang>.gitignore` for each resolved language,
+///      in the order provided.
+///
+/// Silent no-op when the directory or all referenced files are missing.
+pub fn update_gitignore(clone_dir: &Path, dest_dir: &Path, langs: &[String]) -> Result<()> {
+    let additions_dir = clone_dir.join("gitignore-additions");
+    if !additions_dir.is_dir() {
         return Ok(());
     }
-    let additions = fs::read_to_string(&additions_path)
-        .with_context(|| format!("Failed to read {}", additions_path.display()))?;
+
+    let mut fragment_sources: Vec<PathBuf> = Vec::new();
+    let default_path = additions_dir.join("default.gitignore");
+    if default_path.is_file() {
+        fragment_sources.push(default_path);
+    }
+    for lang in langs {
+        let lang_path = additions_dir.join(format!("{}.gitignore", lang));
+        if lang_path.is_file() {
+            fragment_sources.push(lang_path);
+        }
+    }
+
+    if fragment_sources.is_empty() {
+        return Ok(());
+    }
+
+    let mut additions = String::new();
+    for path in &fragment_sources {
+        let frag = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        additions.push_str(&frag);
+        if !additions.ends_with('\n') {
+            additions.push('\n');
+        }
+    }
 
     let gitignore_path = dest_dir.join(".gitignore");
     let existing = if gitignore_path.exists() {
@@ -831,10 +874,15 @@ pub fn update_gitignore(clone_dir: &Path, dest_dir: &Path) -> Result<()> {
 
     let existing_lines: HashSet<&str> = existing.lines().map(str::trim).collect();
 
+    let mut seen_new: HashSet<String> = HashSet::new();
     let new_entries: Vec<&str> = additions
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !existing_lines.contains(line))
+        .filter(|line| {
+            !line.is_empty()
+                && !existing_lines.contains(line)
+                && seen_new.insert((*line).to_string())
+        })
         .collect();
 
     if new_entries.is_empty() {
@@ -1161,7 +1209,7 @@ pub fn cleanup(clone_dir: &Path) -> Result<()> {
 
 // ── Listing ──────────────────────────────────────────────────────────────
 
-const LIST_CATEGORIES: &[&str] = &["mcp", "hooks", "commands", "githooks", "clarg", "languages"];
+const LIST_CATEGORIES: &[&str] = &["mcp", "hooks", "commands", "githooks", "clarg", "gitignore", "languages"];
 
 /// List available named files for a template category.
 pub fn list_category(category: &str, clone_dir: &Path) -> Result<Vec<String>> {
@@ -1171,6 +1219,7 @@ pub fn list_category(category: &str, clone_dir: &Path) -> Result<Vec<String>> {
         "commands" => ("commands", &["md"]),
         "githooks" => ("githooks", &[]),
         "clarg" => ("clarg", &["yaml", "yml"]),
+        "gitignore" => ("gitignore-additions", &["gitignore"]),
         "languages" => ("claude-md/lang-rules", &["md"]),
         _ => bail!(
             "Unknown category '{}'. Valid categories: {}",
@@ -1198,6 +1247,7 @@ pub fn list_category(category: &str, clone_dir: &Path) -> Result<Vec<String>> {
                     .then(|| path.file_stem().unwrap().to_string_lossy().into_owned())
             }
         })
+        .filter(|name| !(category == "gitignore" && name == "default"))
         .collect();
 
     names.sort();
@@ -1362,7 +1412,7 @@ pub fn run_setup(
     // ── Phase 3: dest_dir mutations ─────────────────────────────────────
 
     println!("Updating .gitignore...");
-    update_gitignore(clone_dir, dest_dir)?;
+    update_gitignore(clone_dir, dest_dir, &resolved_languages)?;
 
     println!("Copying files...");
     copy_files(clone_dir, dest_dir)?;
@@ -1853,7 +1903,7 @@ pub fn run_update(
     }
 
     // Always re-apply gitignore additions to the real CWD.
-    update_gitignore(clone_dir, cwd)?;
+    update_gitignore(clone_dir, cwd, &resolved)?;
 
     // Persist new lockfile. Use the template-side manifest (template hashes) as
     // the source of truth so future updates can detect user modifications.

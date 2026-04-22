@@ -104,6 +104,29 @@ fn resolve_conditional_via_mcp_dir() {
 }
 
 #[test]
+fn resolve_conditional_via_gitignore_fragment() {
+    let s = Scaffold::new();
+    s.with_gitignore_for_lang("ziglang", "zig-cache/\n");
+
+    match resolve_language("ziglang", s.path()) {
+        LanguageResolution::ConditionalOnly(name) => assert_eq!(name, "ziglang"),
+        _ => panic!("Expected ConditionalOnly via gitignore fragment"),
+    }
+}
+
+#[test]
+fn resolve_rules_file_preferred_over_gitignore_fragment() {
+    let s = Scaffold::new();
+    s.with_template("", &[("typescript.md", "ts rules")]);
+    s.with_gitignore_for_lang("typescript", "*.tsbuildinfo\n");
+
+    match resolve_language("ts", s.path()) {
+        LanguageResolution::HasRulesFile(name) => assert_eq!(name, "typescript"),
+        _ => panic!("Expected HasRulesFile, gitignore fragment should not override rules file"),
+    }
+}
+
+#[test]
 fn resolve_no_match() {
     let s = Scaffold::new();
 

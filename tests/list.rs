@@ -77,6 +77,74 @@ fn list_languages() {
 }
 
 #[test]
+fn list_gitignore_category_lists_langs() {
+    let s = Scaffold::new();
+    s.with_gitignore_additions(".claude/\n");
+    s.with_gitignore_for_lang("js", "node_modules/\n");
+    s.with_gitignore_for_lang("python", "__pycache__/\n");
+
+    let names = list_category("gitignore", s.path()).unwrap();
+    assert_eq!(names, vec!["js", "python"]);
+}
+
+#[test]
+fn list_gitignore_empty_dir() {
+    let s = Scaffold::new();
+    fs::create_dir_all(s.path().join("gitignore-additions")).unwrap();
+
+    let names = list_category("gitignore", s.path()).unwrap();
+    assert!(names.is_empty());
+}
+
+#[test]
+fn list_gitignore_missing_dir() {
+    let s = Scaffold::new();
+
+    let names = list_category("gitignore", s.path()).unwrap();
+    assert!(names.is_empty());
+}
+
+#[test]
+fn list_gitignore_wrong_extension_excluded() {
+    let s = Scaffold::new();
+    let dir = s.path().join("gitignore-additions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("js.gitignore"), "node_modules/\n").unwrap();
+    fs::write(dir.join("python.txt"), "wrong ext").unwrap();
+
+    let names = list_category("gitignore", s.path()).unwrap();
+    assert_eq!(names, vec!["js"]);
+}
+
+#[test]
+fn list_all_includes_gitignore_section() {
+    let s = Scaffold::new();
+    s.with_gitignore_for_lang("js", "node_modules/\n");
+
+    let output = list_available("all", s.path()).unwrap();
+    assert!(
+        output.contains("gitignore:\n"),
+        "should have gitignore header:\n{output}"
+    );
+    assert!(
+        output.contains("  js\n"),
+        "should list js indented:\n{output}"
+    );
+}
+
+#[test]
+fn list_all_skips_gitignore_when_only_default() {
+    let s = Scaffold::new();
+    s.with_gitignore_additions(".claude/\n");
+
+    let output = list_available("all", s.path()).unwrap();
+    assert!(
+        !output.contains("gitignore:"),
+        "default-only should hide category:\n{output}"
+    );
+}
+
+#[test]
 fn list_empty_dir_returns_empty() {
     let s = Scaffold::new();
     // Dir exists with only a subdirectory, no root-level named files
@@ -182,6 +250,10 @@ fn list_all_skips_empty_categories() {
     assert!(
         !output.contains("languages:"),
         "should skip empty languages:\n{output}"
+    );
+    assert!(
+        !output.contains("gitignore:"),
+        "should skip empty gitignore:\n{output}"
     );
 }
 
