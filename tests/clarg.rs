@@ -2,7 +2,8 @@
 
 mod common;
 
-use clemp::{build_settings, run_setup, setup_clarg, Cli, CLONE_DIR};
+use clemp::{build_settings, run_setup, setup_clarg, SetupArgs, CLONE_DIR};
+use std::path::Path;
 use common::{CwdGuard, Scaffold};
 use serde_json::Value;
 use std::fs;
@@ -142,8 +143,7 @@ fn default_yaml_applied_without_clarg_flag() {
     let _g = CwdGuard::new(workdir.path());
     std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
@@ -151,10 +151,9 @@ fn default_yaml_applied_without_clarg_flag() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    run_setup(&cli, s.path()).unwrap();
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
 
     // clarg-default.yaml copied
     assert!(s.path().join(".claude/clarg-default.yaml").exists());
@@ -185,8 +184,7 @@ fn explicit_clarg_flag_overrides_default() {
     let _g = CwdGuard::new(workdir.path());
     std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
@@ -194,10 +192,9 @@ fn explicit_clarg_flag_overrides_default() {
         githooks: vec![],
         clarg: Some("strict".into()),
         force: false,
-        list: None,
     };
 
-    run_setup(&cli, s.path()).unwrap();
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
 
     // Only strict copied, not default
     assert!(s.path().join(".claude/clarg-strict.yaml").exists());
@@ -224,8 +221,7 @@ fn no_default_yaml_and_no_flag_skips_clarg() {
     let _g = CwdGuard::new(workdir.path());
     std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
@@ -233,10 +229,9 @@ fn no_default_yaml_and_no_flag_skips_clarg() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    run_setup(&cli, s.path()).unwrap();
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
 
     let settings: Value = serde_json::from_str(
         &fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap(),

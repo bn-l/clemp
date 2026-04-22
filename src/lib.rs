@@ -1,11 +1,13 @@
 //! clemp library — core logic for cloning and configuring claude-template.
-//! Provides template rendering, hook/MCP configuration, file copying, and CLI parsing.
+//! Provides template rendering, hook/MCP configuration, file copying, lockfile
+//! tracking for `clemp update`, and CLI parsing.
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +15,7 @@ use std::process::Command;
 use std::{env, fs};
 
 pub const CLONE_DIR: &str = "claude-template";
+pub const LOCKFILE_NAME: &str = ".clemp-lock.yaml";
 
 // ── Config ───────────────────────────────────────────────────────────────
 
@@ -74,13 +77,10 @@ pub fn get_repo_url() -> Result<String> {
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
-#[derive(Parser)]
-#[command(version, about = "Clone and configure claude-template for your project", disable_version_flag = true)]
-pub struct Cli {
-    /// Print version
-    #[arg(short = 'v', short_alias = 'V', long = "version", action = clap::ArgAction::Version)]
-    pub version: (),
-
+/// Shared argument set used by both the default setup command and `clemp update`.
+/// Fields map 1:1 onto `OriginalCommand` fields stored in the lockfile.
+#[derive(Args, Clone, Debug, Default)]
+pub struct SetupArgs {
     /// Language(s) for rules (e.g., ts, typescript, py, python, swift)
     #[arg(value_name = "LANGUAGE")]
     pub languages: Vec<String>,
@@ -105,13 +105,203 @@ pub struct Cli {
     #[arg(long)]
     pub clarg: Option<String>,
 
-    /// Overwrite existing files/directories in the working directory
+    /// Overwrite existing files/directories without prompting for merge
     #[arg(long)]
     pub force: bool,
+}
 
-    /// List available template files for a category (mcp, hooks, commands, githooks, clarg, languages)
-    #[arg(long, num_args = 0..=1, default_missing_value = "all")]
-    pub list: Option<String>,
+#[derive(Parser)]
+#[command(version, about = "Clone and configure claude-template for your project", disable_version_flag = true)]
+pub struct Cli {
+    /// Print version
+    #[arg(short = 'v', short_alias = 'V', long = "version", action = clap::ArgAction::Version)]
+    pub version: (),
+
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+
+    /// Default setup args (used when no subcommand is given)
+    #[command(flatten)]
+    pub setup: SetupArgs,
+}
+
+#[derive(Subcommand)]
+pub enum CliCommand {
+    /// Update an existing clemp-configured project from the template (additive).
+    /// Arguments are unioned into the command stored in .clemp-lock.yaml.
+    Update(UpdateArgs),
+
+    /// List available template files for a category
+    /// (mcp, hooks, commands, githooks, clarg, languages)
+    List {
+        /// Category to list; omit to list every category
+        category: Option<String>,
+    },
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct UpdateArgs {
+    #[command(flatten)]
+    pub setup: SetupArgs,
+
+    /// Delete files the template no longer produces without prompting
+    #[arg(long)]
+    pub prune_stale: bool,
+
+    /// Re-copy files that were removed from the working directory
+    #[arg(long)]
+    pub restore_deleted: bool,
+}
+
+// ── Lockfile ─────────────────────────────────────────────────────────────
+
+/// Captures the invocation that produced a clemp-configured project. Mirrors the
+/// public fields of `SetupArgs` minus `force` (which is runtime-only).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OriginalCommand {
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    #[serde(default)]
+    pub mcp: Vec<String>,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub githooks: Vec<String>,
+    #[serde(default)]
+    pub clarg: Option<String>,
+}
+
+impl OriginalCommand {
+    pub fn from_setup(args: &SetupArgs) -> Self {
+        Self {
+            languages: args.languages.clone(),
+            hooks: args.hooks.clone(),
+            mcp: args.mcp.clone(),
+            commands: args.commands.clone(),
+            githooks: args.githooks.clone(),
+            clarg: args.clarg.clone(),
+        }
+    }
+
+    /// Produce a `SetupArgs` from this stored command. `force` is always `false`
+    /// — runtime flag, not persisted.
+    pub fn into_setup(self) -> SetupArgs {
+        SetupArgs {
+            languages: self.languages,
+            hooks: self.hooks,
+            mcp: self.mcp,
+            commands: self.commands,
+            githooks: self.githooks,
+            clarg: self.clarg,
+            force: false,
+        }
+    }
+
+    /// Additive union with another command (used by `clemp update [args]`).
+    /// `clarg` is replaced only if `other.clarg` is `Some`. Vectors are unioned
+    /// preserving insertion order, skipping duplicates. Languages are deduped
+    /// against their canonical form so `ts` + `typescript` don't both land in
+    /// the merged command (which would otherwise produce duplicate lang-rule
+    /// sections and repeated conditional overlays during render).
+    pub fn merge_additive(&mut self, other: &OriginalCommand) {
+        fn union(a: &mut Vec<String>, b: &[String]) {
+            for item in b {
+                if !a.contains(item) {
+                    a.push(item.clone());
+                }
+            }
+        }
+        fn canonical_key(s: &str) -> String {
+            normalize_language(s)
+                .map(String::from)
+                .unwrap_or_else(|| s.to_lowercase())
+        }
+        fn union_languages(a: &mut Vec<String>, b: &[String]) {
+            let mut seen: HashSet<String> = a.iter().map(|s| canonical_key(s)).collect();
+            for item in b {
+                if seen.insert(canonical_key(item)) {
+                    a.push(item.clone());
+                }
+            }
+        }
+        union_languages(&mut self.languages, &other.languages);
+        union(&mut self.hooks, &other.hooks);
+        union(&mut self.mcp, &other.mcp);
+        union(&mut self.commands, &other.commands);
+        union(&mut self.githooks, &other.githooks);
+        if other.clarg.is_some() {
+            self.clarg = other.clarg.clone();
+        }
+    }
+}
+
+/// Persisted at `.clemp-lock.yaml` in the project root after a successful
+/// `clemp` or `clemp update` run.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Lockfile {
+    #[serde(rename = "template-repo")]
+    pub template_repo: String,
+    #[serde(rename = "template-sha")]
+    pub template_sha: String,
+    #[serde(rename = "original-command")]
+    pub original_command: OriginalCommand,
+    /// Relative path → sha256 hex digest of the file clemp wrote there.
+    /// Paths are normalized to forward-slash form for cross-platform stability.
+    pub files: BTreeMap<String, String>,
+}
+
+impl Lockfile {
+    pub fn path(dest_dir: &Path) -> PathBuf {
+        dest_dir.join(LOCKFILE_NAME)
+    }
+
+    pub fn load(dest_dir: &Path) -> Result<Option<Self>> {
+        let path = Self::path(dest_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let lock: Self = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        Ok(Some(lock))
+    }
+
+    pub fn save(&self, dest_dir: &Path) -> Result<()> {
+        let path = Self::path(dest_dir);
+        let content = serde_yaml::to_string(self)?;
+        fs::write(&path, content)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// SHA-256 hex digest of a file's bytes.
+pub fn hash_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(hash_bytes(&bytes))
+}
+
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Normalize a path to forward-slash form for stable lockfile keys.
+pub fn lockfile_key(path: &Path) -> String {
+    path.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => None,
+            std::path::Component::ParentDir => Some("..".into()),
+            std::path::Component::RootDir => None,
+            std::path::Component::Prefix(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // ── Language handling ────────────────────────────────────────────────────
@@ -169,13 +359,18 @@ pub fn resolve_language(input: &str, clone_dir: &Path) -> LanguageResolution {
     }
 }
 
-/// Resolve all language inputs, erroring on unknown languages.
+/// Resolve all language inputs, erroring on unknown languages. Output is
+/// deduplicated by canonical name so callers never see the same language twice
+/// (e.g. `ts` and `typescript` collapse to a single `typescript` entry).
 pub fn resolve_all_languages(inputs: &[String], clone_dir: &Path) -> Result<Vec<String>> {
     let mut resolved = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for lang in inputs {
         match resolve_language(lang, clone_dir) {
             LanguageResolution::HasRulesFile(canonical) | LanguageResolution::ConditionalOnly(canonical) => {
-                resolved.push(canonical);
+                if seen.insert(canonical.clone()) {
+                    resolved.push(canonical);
+                }
             }
             LanguageResolution::NoMatch => {
                 let canonical = normalize_language(lang)
@@ -584,7 +779,9 @@ pub fn render_claude_md(
 
 // ── Git / filesystem ─────────────────────────────────────────────────────
 
-pub fn clone_repo(repo_url: &str) -> Result<()> {
+/// Clone the template repo to `CLONE_DIR`, removing any stale prior clone.
+/// Returns the HEAD commit SHA of the cloned tree.
+pub fn clone_repo(repo_url: &str) -> Result<String> {
     let clone_path = Path::new(CLONE_DIR);
     if clone_path.exists() {
         eprintln!("Stale '{}' directory found, removing...", CLONE_DIR);
@@ -601,18 +798,33 @@ pub fn clone_repo(repo_url: &str) -> Result<()> {
         let _ = fs::remove_dir_all(clone_path);
         bail!("git clone failed with status: {}", status);
     }
-    Ok(())
+
+    let output = Command::new("git")
+        .args(["-C", CLONE_DIR, "rev-parse", "HEAD"])
+        .output()
+        .context("Failed to read template HEAD sha")?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-pub fn update_gitignore() -> Result<()> {
-    let gitignore_path = Path::new(".gitignore");
-
-    let additions_path = Path::new(CLONE_DIR).join("gitignore-additions");
+/// Append the template's `gitignore-additions` lines to `<dest_dir>/.gitignore`,
+/// skipping any lines already present. Idempotent.
+pub fn update_gitignore(clone_dir: &Path, dest_dir: &Path) -> Result<()> {
+    let additions_path = clone_dir.join("gitignore-additions");
+    if !additions_path.exists() {
+        return Ok(());
+    }
     let additions = fs::read_to_string(&additions_path)
         .with_context(|| format!("Failed to read {}", additions_path.display()))?;
 
+    let gitignore_path = dest_dir.join(".gitignore");
     let existing = if gitignore_path.exists() {
-        fs::read_to_string(gitignore_path)?
+        fs::read_to_string(&gitignore_path)?
     } else {
         String::new()
     };
@@ -630,7 +842,7 @@ pub fn update_gitignore() -> Result<()> {
     }
 
     let mut content = existing;
-    if !content.ends_with('\n') {
+    if !content.ends_with('\n') && !content.is_empty() {
         content.push('\n');
     }
     content.push_str("\n# Claude related\n");
@@ -639,7 +851,10 @@ pub fn update_gitignore() -> Result<()> {
         content.push('\n');
     }
 
-    fs::write(gitignore_path, content)?;
+    if let Some(parent) = gitignore_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&gitignore_path, content)?;
     Ok(())
 }
 
@@ -741,11 +956,12 @@ pub fn collect_conditional_dir_sources(
         .collect()
 }
 
-pub fn copy_files(clone_dir: &Path) -> Result<()> {
+pub fn copy_files(clone_dir: &Path, dest_dir: &Path) -> Result<()> {
     let sources = collect_copy_files_sources(clone_dir)?;
+    fs::create_dir_all(dest_dir)?;
 
     for src in &sources {
-        let dest = Path::new(".").join(src.file_name().unwrap());
+        let dest = dest_dir.join(src.file_name().unwrap());
         if src.is_dir() {
             copy_dir_recursive(src, &dest)?;
         } else {
@@ -1025,14 +1241,30 @@ pub fn list_available(category: &str, clone_dir: &Path) -> Result<String> {
 
 // ── Orchestration ────────────────────────────────────────────────────────
 
-pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
-    // ── Phase 1: clone_dir prep (no CWD mutations) ──────────────────────
+/// Drive the full clemp pipeline: clone-dir prep → conflict check → write to
+/// `dest_dir`. Returns the resolved language list (useful to callers who want to
+/// compute the resulting manifest).
+///
+/// * `check_conflicts` — when `true`, aborts (or prompts with `--force`) if
+///   existing files in `dest_dir` would be overwritten. Set `false` for the
+///   update render pass, which writes into an empty temp dir.
+/// * `install_git_hooks` — when `true`, git hooks are written under
+///   `dest_dir/.git/hooks`. Callers that target a real CWD should gate this on
+///   the presence of a `.git/` directory themselves.
+pub fn run_setup(
+    args: &SetupArgs,
+    clone_dir: &Path,
+    dest_dir: &Path,
+    check_conflicts: bool,
+    install_git_hooks: bool,
+) -> Result<Vec<String>> {
+    // ── Phase 1: clone_dir prep (no dest_dir mutations) ─────────────────
 
     println!("Resolving languages...");
-    let resolved_languages = resolve_all_languages(&cli.languages, clone_dir)?;
+    let resolved_languages = resolve_all_languages(&args.languages, clone_dir)?;
 
     println!("Assembling MCP servers...");
-    let (mcp_json, active_mcps) = assemble_mcp_json(&resolved_languages, &cli.mcp, clone_dir)?;
+    let (mcp_json, active_mcps) = assemble_mcp_json(&resolved_languages, &args.mcp, clone_dir)?;
     fs::write(
         clone_dir.join(".mcp.json"),
         serde_json::to_string_pretty(&mcp_json)?,
@@ -1042,7 +1274,7 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
     let claude_md = render_claude_md(&resolved_languages, &active_mcps, clone_dir)?;
     fs::write(clone_dir.join("CLAUDE.md"), claude_md)?;
 
-    let clarg_name = cli.clarg.clone().or_else(|| {
+    let clarg_name = args.clarg.clone().or_else(|| {
         clone_dir.join("clarg/default.yaml").exists().then(|| "default".into())
     });
     let clarg_entries: Vec<Value> = if let Some(name) = &clarg_name {
@@ -1053,7 +1285,7 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
     };
 
     println!("Building settings...");
-    build_settings(&cli.hooks, &clarg_entries, &active_mcps, clone_dir)?;
+    build_settings(&args.hooks, &clarg_entries, &active_mcps, clone_dir)?;
 
     if clarg_name.is_some() {
         check_clarg_installed();
@@ -1065,7 +1297,7 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
         &resolved_languages,
         &clone_dir.join(".claude/commands"),
     )?;
-    copy_named_commands(&cli.commands, clone_dir)?;
+    copy_named_commands(&args.commands, clone_dir)?;
 
     println!("Assembling skills...");
     copy_conditional_dir(
@@ -1074,82 +1306,181 @@ pub fn run_setup(cli: &Cli, clone_dir: &Path) -> Result<()> {
         &clone_dir.join(".claude/skills"),
     )?;
 
-    // ── Phase 2: pre-flight conflict check (bail before any CWD writes) ─
+    // ── Phase 2: pre-flight conflict check ──────────────────────────────
 
-    println!("Checking for conflicts...");
-    let mut all_cwd_targets = collect_copy_files_sources(clone_dir)?;
-    all_cwd_targets.extend(collect_conditional_dir_sources(
-        &clone_dir.join("copied"),
-        &resolved_languages,
-    ));
-    let mut conflicts = collect_conflicts(&all_cwd_targets, Path::new("."));
-
-    // Git hooks conflict check
     let githooks_dir = clone_dir.join("githooks");
-    let git_hooks_dest = Path::new(".git/hooks");
-    let mut githooks_sources = collect_conditional_dir_sources(&githooks_dir, &resolved_languages);
-    for name in &cli.githooks {
-        let src = githooks_dir.join(name);
-        if src.is_file() {
-            githooks_sources.push(src);
+    let git_hooks_dest = dest_dir.join(".git/hooks");
+
+    if check_conflicts {
+        println!("Checking for conflicts...");
+        let mut all_cwd_targets = collect_copy_files_sources(clone_dir)?;
+        all_cwd_targets.extend(collect_conditional_dir_sources(
+            &clone_dir.join("copied"),
+            &resolved_languages,
+        ));
+        let mut conflicts = collect_conflicts(&all_cwd_targets, dest_dir);
+
+        let mut githooks_sources =
+            collect_conditional_dir_sources(&githooks_dir, &resolved_languages);
+        for name in &args.githooks {
+            let src = githooks_dir.join(name);
+            if src.is_file() {
+                githooks_sources.push(src);
+            }
         }
-    }
-    if git_hooks_dest.is_dir() {
-        conflicts.extend(collect_conflicts(&githooks_sources, git_hooks_dest));
-    }
+        if install_git_hooks && git_hooks_dest.is_dir() {
+            conflicts.extend(collect_conflicts(&githooks_sources, &git_hooks_dest));
+        }
 
-    if !conflicts.is_empty() {
-        let names: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
+        if !conflicts.is_empty() {
+            let names: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
 
-        if !cli.force {
-            bail!(
-                "The following files/directories already exist and would be overwritten:\n  {}\nRemove them first, run from a clean directory, or use --force.",
+            if !args.force {
+                bail!(
+                    "The following files/directories already exist and would be overwritten:\n  {}\nRemove them first, run from a clean directory, or use --force.\n\nIf this is a previously clemp-configured project, try `clemp update` instead.",
+                    names.join("\n  ")
+                );
+            }
+
+            println!(
+                "The following files/directories will be overwritten:\n  {}",
                 names.join("\n  ")
             );
-        }
-
-        println!(
-            "The following files/directories will be overwritten:\n  {}",
-            names.join("\n  ")
-        );
-        if !confirm("Proceed?")? {
-            bail!("Aborted.");
-        }
-        for path in &conflicts {
-            if path.is_dir() {
-                fs::remove_dir_all(path)?;
-            } else {
-                fs::remove_file(path)?;
+            if !confirm("Proceed?")? {
+                bail!("Aborted.");
+            }
+            for path in &conflicts {
+                if path.is_dir() {
+                    fs::remove_dir_all(path)?;
+                } else {
+                    fs::remove_file(path)?;
+                }
             }
         }
     }
 
-    // ── Phase 3: CWD mutations (conflicts already cleared) ──────────────
+    // ── Phase 3: dest_dir mutations ─────────────────────────────────────
 
     println!("Updating .gitignore...");
-    update_gitignore()?;
+    update_gitignore(clone_dir, dest_dir)?;
 
     println!("Copying files...");
-    copy_files(clone_dir)?;
+    copy_files(clone_dir, dest_dir)?;
 
     println!("Copying language-specific files...");
-    copy_conditional_dir(
-        &clone_dir.join("copied"),
-        &resolved_languages,
-        Path::new("."),
-    )?;
+    copy_conditional_dir(&clone_dir.join("copied"), &resolved_languages, dest_dir)?;
 
-    // Install git hooks
-    if Path::new(".git").is_dir() {
-        if githooks_dir.exists() || !cli.githooks.is_empty() {
+    if install_git_hooks {
+        if githooks_dir.exists() || !args.githooks.is_empty() {
             println!("Installing git hooks...");
-            copy_conditional_githooks(&githooks_dir, &resolved_languages, git_hooks_dest)?;
-            copy_named_githooks(&cli.githooks, clone_dir, git_hooks_dest)?;
+            copy_conditional_githooks(&githooks_dir, &resolved_languages, &git_hooks_dest)?;
+            copy_named_githooks(&args.githooks, clone_dir, &git_hooks_dest)?;
         }
-    } else if !cli.githooks.is_empty() || githooks_dir.join("default").is_dir() {
-        eprintln!("Warning: No .git/ directory found, skipping git hooks installation");
+    } else if !args.githooks.is_empty() || githooks_dir.join("default").is_dir() {
+        eprintln!("Warning: git hooks not installed (no .git/ directory in target)");
     }
 
+    Ok(resolved_languages)
+}
+
+/// Enumerate every file clemp wrote under `dest_dir` (derived from `clone_dir`'s
+/// staged tree + conditional dirs + git hooks) and compute its SHA-256.
+/// Excludes `.gitignore` and the lockfile itself. Paths in the returned map are
+/// normalized to forward-slash form.
+pub fn compute_manifest(
+    args: &SetupArgs,
+    resolved_languages: &[String],
+    clone_dir: &Path,
+    dest_dir: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let mut manifest = BTreeMap::new();
+
+    // 1. Anything copy_files would have placed in dest_dir (recursively).
+    for entry in fs::read_dir(clone_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if COPY_FILES_EXCLUDE.contains(&name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let rel_start = PathBuf::from(&name);
+        hash_tree_into_manifest(dest_dir, &rel_start, &mut manifest)?;
+    }
+
+    // 2. copied/default/ and copied/<lang>/ flattened under dest_dir.
+    let copied_dir = clone_dir.join("copied");
+    let mut overlay_dirs: Vec<PathBuf> = Vec::new();
+    if copied_dir.join("default").is_dir() {
+        overlay_dirs.push(copied_dir.join("default"));
+    }
+    for lang in resolved_languages {
+        let ld = copied_dir.join(lang);
+        if ld.is_dir() {
+            overlay_dirs.push(ld);
+        }
+    }
+    for overlay in &overlay_dirs {
+        for entry in fs::read_dir(overlay)? {
+            let entry = entry?;
+            let rel_start = PathBuf::from(entry.file_name());
+            hash_tree_into_manifest(dest_dir, &rel_start, &mut manifest)?;
+        }
+    }
+
+    // 3. Git hooks (flat filenames) under dest_dir/.git/hooks/.
+    let githooks_src = clone_dir.join("githooks");
+    let mut git_hook_names: BTreeMap<String, ()> = BTreeMap::new();
+    let mut collect_names = |dir: &Path| -> Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let e = entry?;
+            if e.path().is_file() {
+                git_hook_names.insert(e.file_name().to_string_lossy().into_owned(), ());
+            }
+        }
+        Ok(())
+    };
+    collect_names(&githooks_src.join("default"))?;
+    for lang in resolved_languages {
+        collect_names(&githooks_src.join(lang))?;
+    }
+    for name in &args.githooks {
+        git_hook_names.insert(name.clone(), ());
+    }
+    for name in git_hook_names.keys() {
+        let rel = PathBuf::from(".git/hooks").join(name);
+        let full = dest_dir.join(&rel);
+        if full.is_file() {
+            manifest.insert(lockfile_key(&rel), hash_file(&full)?);
+        }
+    }
+
+    // Never track these — user-owned or clemp-meta.
+    manifest.remove(".gitignore");
+    manifest.remove(LOCKFILE_NAME);
+
+    Ok(manifest)
+}
+
+fn hash_tree_into_manifest(
+    dest_dir: &Path,
+    rel_start: &Path,
+    manifest: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let full = dest_dir.join(rel_start);
+    if !full.exists() {
+        return Ok(());
+    }
+    if full.is_file() {
+        manifest.insert(lockfile_key(rel_start), hash_file(&full)?);
+        return Ok(());
+    }
+    for entry in fs::read_dir(&full)? {
+        let entry = entry?;
+        let sub_rel = rel_start.join(entry.file_name());
+        hash_tree_into_manifest(dest_dir, &sub_rel, manifest)?;
+    }
     Ok(())
 }
 
@@ -1160,4 +1491,383 @@ pub fn split_multi_values(values: Vec<String>) -> Vec<String> {
         .flat_map(|v| v.split_whitespace())
         .map(String::from)
         .collect()
+}
+
+/// Normalize all multi-value fields in-place (replaces clap's comma-only split
+/// with comma+whitespace splitting).
+pub fn normalize_setup_args(args: &mut SetupArgs) {
+    args.hooks = split_multi_values(std::mem::take(&mut args.hooks));
+    args.mcp = split_multi_values(std::mem::take(&mut args.mcp));
+    args.commands = split_multi_values(std::mem::take(&mut args.commands));
+    args.githooks = split_multi_values(std::mem::take(&mut args.githooks));
+}
+
+// ── Update flow ──────────────────────────────────────────────────────────
+
+/// Check whether the `claude` CLI is on PATH.
+pub fn claude_available() -> bool {
+    Command::new("which")
+        .arg("claude")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Launch an interactive `claude` session to merge template changes into a
+/// user-modified file. Uses `--model sonnet --permission-mode acceptEdits` so
+/// file edits proceed without additional prompting inside Claude. Returns an
+/// error on non-zero exit so the caller can abort before persisting a new
+/// lockfile baseline.
+pub fn merge_with_claude(rel_path: &str, staging: &Path, cwd: &Path) -> Result<()> {
+    let new_file = staging.join(rel_path);
+    let cur_file = cwd.join(rel_path);
+
+    let prompt = format!(
+        "Merge the template update at @{new} into @{cur}. \
+         The user has customized @{cur} and the template has also changed independently. \
+         Preserve the user's customizations while incorporating the template's updates. \
+         Edit @{cur} in place. Do not create any new files.",
+        new = new_file.display(),
+        cur = cur_file.display(),
+    );
+
+    println!("\n— Merging {rel_path} —");
+    let status = Command::new("claude")
+        .args([
+            "--model",
+            "sonnet",
+            "--permission-mode",
+            "acceptEdits",
+            &prompt,
+        ])
+        .status()
+        .context("Failed to invoke `claude`")?;
+
+    if !status.success() {
+        bail!(
+            "claude exited with {} while merging {} — aborting update so the lockfile baseline stays intact.\n\
+             Re-run with `--force` to overwrite your edits with the template version.",
+            status,
+            rel_path
+        );
+    }
+    Ok(())
+}
+
+/// Apply a single manifest entry from `staging_dir` to `cwd`, creating parents
+/// and (on Unix) preserving executable bit for `.git/hooks/` entries. If `dest`
+/// currently exists as a directory (shape collision resolved via `--force`), it
+/// is removed before the file is written.
+fn apply_one(key: &str, staging_dir: &Path, cwd: &Path) -> Result<()> {
+    let src = staging_dir.join(key);
+    let dest = cwd.join(key);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if dest.is_dir() {
+        fs::remove_dir_all(&dest)
+            .with_context(|| format!("Failed to remove directory at {}", dest.display()))?;
+    }
+    fs::copy(&src, &dest)
+        .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
+    #[cfg(unix)]
+    if key.starts_with(".git/hooks/") {
+        set_executable(&dest)?;
+    }
+    Ok(())
+}
+
+/// Classification for a single manifest entry during `clemp update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateClass {
+    /// Old == current on disk, new differs — safe template refresh.
+    Clean,
+    /// Not tracked, not on disk — straight copy.
+    New,
+    /// Not tracked, but user has a file at this path with different content — needs merge.
+    Collision,
+    /// Tracked, user modified it, and template changed it — needs merge.
+    Conflict,
+    /// Tracked, user modified it, template unchanged — leave user's version.
+    Skipped,
+    /// Tracked, user deleted it — restore only with `--restore-deleted`.
+    Missing,
+    /// A directory exists at a path where the template now wants a file.
+    /// Resolvable only by `--force` (Claude cannot merge into a directory).
+    ShapeCollision,
+    /// Template hash matches what's on disk — already in sync, no-op.
+    Identical,
+}
+
+/// Classify a single update path from its (old, current, new) hash triple plus
+/// the on-disk "shape" at that path. Extracted for direct unit testing.
+pub fn classify_update_path(
+    old_hash: Option<&str>,
+    cur_hash: Option<&str>,
+    new_hash: &str,
+    cwd_is_dir: bool,
+) -> UpdateClass {
+    if cwd_is_dir {
+        return UpdateClass::ShapeCollision;
+    }
+    match (old_hash, cur_hash) {
+        (None, None) => UpdateClass::New,
+        (None, Some(cur)) => {
+            if cur == new_hash {
+                UpdateClass::Identical
+            } else {
+                UpdateClass::Collision
+            }
+        }
+        (Some(_), None) => UpdateClass::Missing,
+        (Some(old), Some(cur)) => {
+            if cur == old {
+                if new_hash == old {
+                    UpdateClass::Identical
+                } else {
+                    UpdateClass::Clean
+                }
+            } else if new_hash == old {
+                UpdateClass::Skipped
+            } else {
+                UpdateClass::Conflict
+            }
+        }
+    }
+}
+
+/// Drive `clemp update`: diff the new template render against the lockfile +
+/// current working tree, apply non-conflicting changes, route conflicts to
+/// Claude (or `--force` overwrite), and persist an updated lockfile.
+pub fn run_update(
+    args: &UpdateArgs,
+    clone_dir: &Path,
+    template_sha: &str,
+    template_repo: &str,
+) -> Result<()> {
+    let cwd = Path::new(".");
+
+    let lockfile = Lockfile::load(cwd)?.with_context(|| format!(
+        "No {LOCKFILE_NAME} found in current directory.\nThis doesn't look like a clemp-configured project — run `clemp <args>` to set one up first."
+    ))?;
+
+    let merged_command = {
+        let mut m = lockfile.original_command.clone();
+        m.merge_additive(&OriginalCommand::from_setup(&args.setup));
+        m
+    };
+
+    let sha_unchanged = template_sha == lockfile.template_sha;
+    let command_unchanged = merged_command == lockfile.original_command;
+    // `--restore-deleted` must inspect the working tree even when nothing in the
+    // template has changed, so it cannot share the unchanged-template fast path.
+    if sha_unchanged && command_unchanged && !args.restore_deleted {
+        println!("Already up to date.");
+        return Ok(());
+    }
+
+    // Render the new template into a temp staging directory.
+    let staging = env::temp_dir().join(format!("clemp-update-{}", std::process::id()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+
+    let setup_args = {
+        let mut s = merged_command.clone().into_setup();
+        s.force = args.setup.force;
+        s
+    };
+
+    let resolved = run_setup(&setup_args, clone_dir, &staging, false, true)?;
+    let new_manifest = compute_manifest(&setup_args, &resolved, clone_dir, &staging)?;
+
+    // Classify every file in the new render.
+    let mut clean: Vec<String> = Vec::new();
+    let mut new_files: Vec<String> = Vec::new();
+    let mut collisions: Vec<String> = Vec::new(); // template-new, user already has something there
+    let mut conflicts: Vec<String> = Vec::new();  // user modified AND template changed
+    let mut skipped: Vec<String> = Vec::new();    // user modified, template unchanged
+    let mut restore_pending: Vec<String> = Vec::new(); // user deleted clemp-managed file
+    let mut shape_collisions: Vec<String> = Vec::new(); // dir exists at file-target path
+
+    for (path, new_hash) in &new_manifest {
+        let cwd_path = cwd.join(path);
+        let cwd_is_dir = cwd_path.is_dir();
+        let cur_hash = if cwd_path.is_file() { Some(hash_file(&cwd_path)?) } else { None };
+        let old_hash = lockfile.files.get(path).map(String::as_str);
+
+        match classify_update_path(old_hash, cur_hash.as_deref(), new_hash, cwd_is_dir) {
+            UpdateClass::Identical => {}
+            UpdateClass::Clean => clean.push(path.clone()),
+            UpdateClass::New => new_files.push(path.clone()),
+            UpdateClass::Collision => collisions.push(path.clone()),
+            UpdateClass::Conflict => conflicts.push(path.clone()),
+            UpdateClass::Skipped => skipped.push(path.clone()),
+            UpdateClass::Missing => {
+                if args.restore_deleted {
+                    new_files.push(path.clone());
+                } else {
+                    restore_pending.push(path.clone());
+                }
+            }
+            UpdateClass::ShapeCollision => shape_collisions.push(path.clone()),
+        }
+    }
+
+    let stale: Vec<String> = lockfile
+        .files
+        .keys()
+        .filter(|p| !new_manifest.contains_key(*p))
+        .cloned()
+        .collect();
+
+    println!("\nUpdate plan:");
+    if !clean.is_empty()    { println!("  {:>3} cleanly updated", clean.len()); }
+    if !new_files.is_empty() { println!("  {:>3} new", new_files.len()); }
+    if !skipped.is_empty()   { println!("  {:>3} preserved (user-modified, template unchanged)", skipped.len()); }
+    if !conflicts.is_empty() { println!("  {:>3} conflicting (user + template both changed)", conflicts.len()); }
+    if !collisions.is_empty(){ println!("  {:>3} collisions (template introduced file, you already have one)", collisions.len()); }
+    if !shape_collisions.is_empty() {
+        println!("  {:>3} shape collisions (directory exists where template wants a file)", shape_collisions.len());
+    }
+    if !stale.is_empty()     { println!("  {:>3} stale (template no longer produces)", stale.len()); }
+    if !restore_pending.is_empty() {
+        println!("  {:>3} missing (use --restore-deleted to re-add)", restore_pending.len());
+    }
+
+    // Shape collisions can only be resolved by --force (Claude can't merge into a directory).
+    if !shape_collisions.is_empty() && !args.setup.force {
+        let _ = fs::remove_dir_all(&staging);
+        bail!(
+            "The following paths exist as directories but the template now wants a file there:\n  {}\n\n\
+             Re-run with `--force` to replace the directories with the template's file, \
+             or remove/move the directories yourself.",
+            shape_collisions.join("\n  ")
+        );
+    }
+
+    // Blocker-stale: a stale path that exists on disk as a FILE and whose
+    // path is a parent of some new/clean write. If left in place, `create_dir_all`
+    // during the clean/new phase would fail after merges had already been
+    // applied. Gate this in preflight so declining deletion can't produce a
+    // half-applied update.
+    let blocker_stale: Vec<String> = stale
+        .iter()
+        .filter(|path| {
+            if !cwd.join(path).is_file() { return false; }
+            let prefix = format!("{}/", path);
+            clean.iter().chain(new_files.iter()).any(|p| p.starts_with(&prefix))
+        })
+        .cloned()
+        .collect();
+    if !blocker_stale.is_empty() && !args.prune_stale {
+        let _ = fs::remove_dir_all(&staging);
+        bail!(
+            "The following files must be removed because the template now produces \
+             a directory at their path:\n  {}\n\n\
+             Re-run with `--prune-stale` to delete them, or remove them yourself.",
+            blocker_stale.join("\n  ")
+        );
+    }
+
+    // Conflicts AND collisions both route through Claude. Gate before any writes.
+    let needs_claude = (!conflicts.is_empty() || !collisions.is_empty()) && !args.setup.force;
+    if needs_claude && !claude_available() {
+        let _ = fs::remove_dir_all(&staging);
+        let affected: Vec<String> = conflicts.iter().chain(collisions.iter()).cloned().collect();
+        bail!(
+            "The following files need an interactive merge (you've changed them and so has the template, \
+             or the template now wants a path you already use):\n  {}\n\n\
+             `claude` CLI not found on PATH — interactive merging isn't possible.\n\
+             Options:\n  \
+             - Install Claude Code and re-run `clemp update`\n  \
+             - Run `clemp update --force` to overwrite your edits with the template version",
+            affected.join("\n  ")
+        );
+    }
+
+    // Run the fail-prone work (Claude merges) BEFORE any destructive step
+    // (stale deletions) or clean/new writes. If a merge fails we bail via `?`
+    // with the working tree still classifiable:
+    // - lockfile still pinned to the old SHA
+    // - stale files still on disk (not yet deleted)
+    // - clean files still at their old hashes (so next retry classifies them as
+    //   `clean` instead of bogus `conflict` via old != cur == new).
+
+    // Collisions: path is new from template's perspective. Overwrite with --force,
+    // else route through Claude merge (treat like a conflict).
+    for path in &collisions {
+        if args.setup.force {
+            apply_one(path, &staging, cwd)?;
+        } else {
+            merge_with_claude(path, &staging, cwd)?;
+        }
+    }
+
+    // Conflicts: --force overwrites, else Claude merges.
+    for path in &conflicts {
+        if args.setup.force {
+            apply_one(path, &staging, cwd)?;
+        } else {
+            merge_with_claude(path, &staging, cwd)?;
+        }
+    }
+
+    // Shape collisions reach here only with --force.
+    for path in &shape_collisions {
+        apply_one(path, &staging, cwd)?;
+    }
+
+    // Stale handling runs AFTER merges (so a failed merge can't lose stale
+    // files under `--prune-stale`) but BEFORE clean/new writes (so file→dir
+    // template transitions have the old file gone before the new directory
+    // tree is written).
+    for path in &stale {
+        let target = cwd.join(path);
+        if !target.exists() {
+            continue;
+        }
+        let delete = if args.prune_stale {
+            true
+        } else {
+            confirm(&format!(
+                "Template no longer produces {path}. Delete this file?"
+            ))?
+        };
+        if delete {
+            if target.is_dir() {
+                fs::remove_dir_all(&target)?;
+            } else {
+                fs::remove_file(&target)?;
+            }
+        }
+    }
+
+    // Finally, apply non-conflicting writes. These are straight copies and
+    // shouldn't fail on a healthy filesystem; doing them last means the rest of
+    // the update is already committed before we touch paths the user considers
+    // "clean".
+    for path in clean.iter().chain(new_files.iter()) {
+        apply_one(path, &staging, cwd)?;
+    }
+
+    // Always re-apply gitignore additions to the real CWD.
+    update_gitignore(clone_dir, cwd)?;
+
+    // Persist new lockfile. Use the template-side manifest (template hashes) as
+    // the source of truth so future updates can detect user modifications.
+    let new_lockfile = Lockfile {
+        template_repo: template_repo.to_string(),
+        template_sha: template_sha.to_string(),
+        original_command: merged_command,
+        files: new_manifest,
+    };
+    new_lockfile.save(cwd)?;
+
+    // Cleanup staging.
+    let _ = fs::remove_dir_all(&staging);
+
+    println!("\nUpdate complete.");
+    Ok(())
 }

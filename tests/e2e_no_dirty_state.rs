@@ -4,7 +4,7 @@
 
 mod common;
 
-use clemp::{run_setup, Cli, CLONE_DIR};
+use clemp::{run_setup, SetupArgs, CLONE_DIR};
 use common::{CwdGuard, Scaffold};
 use std::collections::BTreeMap;
 use std::fs;
@@ -58,9 +58,8 @@ fn full_scaffold() -> Scaffold {
     s
 }
 
-fn default_cli() -> Cli {
-    Cli {
-        version: (),
+fn default_cli() -> SetupArgs {
+    SetupArgs {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
@@ -68,7 +67,6 @@ fn default_cli() -> Cli {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     }
 }
 
@@ -82,13 +80,13 @@ fn setup_workdir(s: &Scaffold) -> (TempDir, CwdGuard) {
 /// Assert run_setup errors, the message contains `expected_substr`, and CWD is
 /// byte-for-byte identical to `before`.
 fn assert_clean_abort(
-    cli: &Cli,
+    args: &SetupArgs,
     clone_dir: &Path,
     before: &BTreeMap<String, Vec<u8>>,
     workdir: &Path,
     expected_substr: &str,
 ) {
-    let result = run_setup(cli, clone_dir);
+    let result = run_setup(args, clone_dir, Path::new("."), true, false);
     assert!(result.is_err(), "expected run_setup to fail");
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -191,7 +189,7 @@ fn multiple_conflicts_all_reported_cwd_clean() {
     fs::write(workdir.path().join(".editorconfig"), "x").unwrap();
     let before = snapshot_dir(workdir.path());
 
-    let result = run_setup(&default_cli(), s.path());
+    let result = run_setup(&default_cli(), s.path(), Path::new("."), true, false);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("CLAUDE.md"), "should mention CLAUDE.md: {msg}");
@@ -242,13 +240,13 @@ fn second_run_after_success_aborts_cleanly() {
     let (workdir, _g) = setup_workdir(&s);
 
     // First run succeeds
-    run_setup(&default_cli(), s.path()).unwrap();
+    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
 
     // Snapshot CWD after successful first run
     let before = snapshot_dir(workdir.path());
 
     // Second run must fail (everything exists now) and leave CWD identical
-    let result = run_setup(&default_cli(), s.path());
+    let result = run_setup(&default_cli(), s.path(), Path::new("."), true, false);
     assert!(result.is_err());
 
     let after = snapshot_dir(workdir.path());
@@ -282,7 +280,7 @@ fn conflict_does_not_leave_clone_dir_artifacts_in_cwd() {
 
     fs::write(workdir.path().join(".mcp.json"), "conflict").unwrap();
 
-    let _ = run_setup(&default_cli(), s.path());
+    let _ = run_setup(&default_cli(), s.path(), Path::new("."), true, false);
 
     // Verify no artifacts leaked — these are built inside clone_dir during
     // phase 1 but must never reach CWD when phase 2 aborts.

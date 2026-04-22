@@ -5,7 +5,7 @@ mod common;
 
 use clemp::{
     cleanup, collect_conditional_dir_sources, collect_conflicts, collect_copy_files_sources,
-    copy_conditional_dir, copy_dir_recursive, copy_files, run_setup, update_gitignore, Cli,
+    copy_conditional_dir, copy_dir_recursive, copy_files, run_setup, update_gitignore, SetupArgs,
     CLONE_DIR,
 };
 use common::{setup_gitignore_test, CwdGuard, Scaffold};
@@ -87,7 +87,7 @@ fn copy_dir_recursive_empty_dir() {
 fn gitignore_creates_new_file() {
     let (workdir, _g) = setup_gitignore_test(None, ".claude/\n.clinerules\n");
 
-    update_gitignore().unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.contains("# Claude related"));
@@ -99,7 +99,7 @@ fn gitignore_creates_new_file() {
 fn gitignore_appends_to_existing() {
     let (workdir, _g) = setup_gitignore_test(Some("node_modules/\n"), ".claude/\nnode_modules/\n");
 
-    update_gitignore().unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.starts_with("node_modules/\n"));
@@ -116,7 +116,7 @@ fn gitignore_no_op_when_all_present() {
     let (workdir, _g) =
         setup_gitignore_test(Some(".claude/\n.clinerules\n"), ".claude/\n.clinerules\n");
 
-    update_gitignore().unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(!content.contains("# Claude related"));
@@ -126,7 +126,7 @@ fn gitignore_no_op_when_all_present() {
 fn gitignore_handles_whitespace_in_additions() {
     let (workdir, _g) = setup_gitignore_test(None, "  .claude/  \n  \n.foo\n");
 
-    update_gitignore().unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.contains(".claude/"));
@@ -140,7 +140,7 @@ fn gitignore_appends_newline_if_missing() {
         ".claude/\n",
     );
 
-    update_gitignore().unwrap();
+    update_gitignore(Path::new(CLONE_DIR), Path::new(".")).unwrap();
 
     let content = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(content.contains("node_modules/\n\n# Claude related"));
@@ -175,7 +175,7 @@ fn copy_files_excludes_reserved_entries() {
     let workdir = TempDir::new().unwrap();
     let _g = CwdGuard::new(workdir.path());
 
-    copy_files(s.path()).unwrap();
+    copy_files(s.path(), Path::new(".")).unwrap();
 
     // Should be copied
     assert!(workdir.path().join("CLAUDE.md").exists());
@@ -389,8 +389,7 @@ fn run_setup_full_flow() {
     // Symlink CLONE_DIR in workdir to the scaffold (for update_gitignore)
     std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec!["ts".into()],
         hooks: vec![],
         mcp: vec![],
@@ -398,10 +397,9 @@ fn run_setup_full_flow() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    run_setup(&cli, s.path()).unwrap();
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
 
     // .gitignore created with additions
     let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
@@ -499,8 +497,7 @@ fn run_setup_aborts_cleanly_on_copy_files_conflict() {
     // Pre-existing CLAUDE.md in CWD — will conflict with copy_files
     fs::write(workdir.path().join("CLAUDE.md"), "existing").unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec![],
         hooks: vec![],
         mcp: vec![],
@@ -508,10 +505,9 @@ fn run_setup_aborts_cleanly_on_copy_files_conflict() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    let result = run_setup(&cli, s.path());
+    let result = run_setup(&args, s.path(), Path::new("."), true, false);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("CLAUDE.md"));
 
@@ -541,8 +537,7 @@ fn run_setup_aborts_cleanly_on_copied_dir_conflict() {
     // Pre-existing AGENTS.md — will conflict with copy_conditional_dir(copied/)
     fs::write(workdir.path().join("AGENTS.md"), "existing").unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec![],
         hooks: vec![],
         mcp: vec![],
@@ -550,10 +545,9 @@ fn run_setup_aborts_cleanly_on_copied_dir_conflict() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    let result = run_setup(&cli, s.path());
+    let result = run_setup(&args, s.path(), Path::new("."), true, false);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("AGENTS.md"));
 
@@ -664,8 +658,7 @@ fn run_setup_with_named_hooks_and_mcps() {
     let _g = CwdGuard::new(workdir.path());
     std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec!["ts".into()],
         hooks: vec!["blocker".into()],
         mcp: vec!["maps".into()],
@@ -673,10 +666,9 @@ fn run_setup_with_named_hooks_and_mcps() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    run_setup(&cli, s.path()).unwrap();
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
 
     // Settings has both default + blocker hooks merged
     let settings: Value = serde_json::from_str(
@@ -729,8 +721,7 @@ fn run_setup_with_lang_conditionals() {
     let _g = CwdGuard::new(workdir.path());
     std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec!["svelte".into()],
         hooks: vec![],
         mcp: vec![],
@@ -738,10 +729,9 @@ fn run_setup_with_lang_conditionals() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    run_setup(&cli, s.path()).unwrap();
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
 
     // Commands
     assert!(workdir.path().join(".claude/commands/base.md").exists());
@@ -786,8 +776,7 @@ fn run_setup_multiple_languages() {
     let _g = CwdGuard::new(workdir.path());
     std::os::unix::fs::symlink(s.path(), workdir.path().join(CLONE_DIR)).unwrap();
 
-    let cli = Cli {
-        version: (),
+    let args = SetupArgs {
         languages: vec!["ts".into(), "svelte".into()],
         hooks: vec![],
         mcp: vec![],
@@ -795,10 +784,9 @@ fn run_setup_multiple_languages() {
         githooks: vec![],
         clarg: None,
         force: false,
-        list: None,
     };
 
-    run_setup(&cli, s.path()).unwrap();
+    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
 
     // CLAUDE.md contains both language rules
     let claude = fs::read_to_string(workdir.path().join("CLAUDE.md")).unwrap();

@@ -196,3 +196,88 @@ pub fn setup_gitignore_test(existing: Option<&str>, additions: &str) -> (TempDir
     let guard = CwdGuard::new(workdir.path());
     (workdir, guard)
 }
+
+/// RAII guard that overwrites `PATH` for the test (must be created while a
+/// `CwdGuard` is held — both share the same global lock for serialization).
+pub struct PathGuard {
+    prev: Option<String>,
+}
+
+impl PathGuard {
+    /// Replace PATH with `dir:/usr/bin:/bin` so subprocesses see only the test's
+    /// fake shims plus the standard system tools (`which`, `git`, etc.).
+    pub fn replace_with(dir: &Path) -> Self {
+        let prev = env::var("PATH").ok();
+        // Safety: tests serialize global state via `CWD_LOCK` (held by `CwdGuard`).
+        unsafe { env::set_var("PATH", format!("{}:/usr/bin:/bin", dir.display())); }
+        Self { prev }
+    }
+
+    /// Replace PATH with just `/usr/bin:/bin` (no test shim) so `claude` cannot
+    /// be located even by `which`.
+    pub fn system_only() -> Self {
+        let prev = env::var("PATH").ok();
+        unsafe { env::set_var("PATH", "/usr/bin:/bin"); }
+        Self { prev }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev {
+                Some(p) => env::set_var("PATH", p),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
+/// RAII guard for environment variables. Restores prior values on drop.
+pub struct EnvVarGuard {
+    keys: Vec<(String, Option<String>)>,
+}
+
+impl EnvVarGuard {
+    pub fn new() -> Self {
+        Self { keys: vec![] }
+    }
+
+    pub fn set(&mut self, key: &str, value: &str) {
+        let prev = env::var(key).ok();
+        self.keys.push((key.to_string(), prev));
+        unsafe { env::set_var(key, value); }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (k, v) in self.keys.drain(..) {
+            unsafe {
+                match v {
+                    Some(val) => env::set_var(&k, val),
+                    None => env::remove_var(&k),
+                }
+            }
+        }
+    }
+}
+
+/// Install a fake `claude` shell script into `bindir`. Behavior is controlled
+/// at run time by environment variables:
+///   - `FAKE_CLAUDE_EXIT`: exit code (default `0`)
+///   - `FAKE_CLAUDE_TARGET`: file path to overwrite (optional)
+///   - `FAKE_CLAUDE_CONTENT`: bytes to write into TARGET (default `MERGED`)
+pub fn install_fake_claude(bindir: &Path) {
+    fs::create_dir_all(bindir).unwrap();
+    let script = bindir.join("claude");
+    let body = r#"#!/bin/sh
+if [ -n "$FAKE_CLAUDE_TARGET" ]; then
+    printf '%s' "${FAKE_CLAUDE_CONTENT:-MERGED}" > "$FAKE_CLAUDE_TARGET"
+fi
+exit "${FAKE_CLAUDE_EXIT:-0}"
+"#;
+    fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+}

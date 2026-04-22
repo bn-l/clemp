@@ -57,58 +57,58 @@ fn split_multi_values_single_value_no_split() {
 fn cli_mcp_space_separated() {
     let cli =
         Cli::try_parse_from(["clemp", "ts", "--mcp", "context7", "sequential-thinking"]).unwrap();
-    assert_eq!(cli.mcp, vec!["context7", "sequential-thinking"]);
+    assert_eq!(cli.setup.mcp, vec!["context7", "sequential-thinking"]);
 }
 
 #[test]
 fn cli_mcp_comma_separated() {
     let cli =
         Cli::try_parse_from(["clemp", "ts", "--mcp", "context7,sequential-thinking"]).unwrap();
-    assert_eq!(cli.mcp, vec!["context7", "sequential-thinking"]);
+    assert_eq!(cli.setup.mcp, vec!["context7", "sequential-thinking"]);
 }
 
 #[test]
 fn cli_mcp_mixed_comma_and_space() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--mcp", "a,b", "c"]).unwrap();
-    assert_eq!(cli.mcp, vec!["a", "b", "c"]);
+    assert_eq!(cli.setup.mcp, vec!["a", "b", "c"]);
 }
 
 #[test]
 fn cli_hooks_space_separated() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--hooks", "sound", "lint"]).unwrap();
-    assert_eq!(cli.hooks, vec!["sound", "lint"]);
+    assert_eq!(cli.setup.hooks, vec!["sound", "lint"]);
 }
 
 #[test]
 fn cli_hooks_comma_separated() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--hooks", "sound,lint"]).unwrap();
-    assert_eq!(cli.hooks, vec!["sound", "lint"]);
+    assert_eq!(cli.setup.hooks, vec!["sound", "lint"]);
 }
 
 #[test]
 fn cli_no_flags_gives_empty_vecs() {
     let cli = Cli::try_parse_from(["clemp", "ts"]).unwrap();
-    assert!(cli.hooks.is_empty());
-    assert!(cli.mcp.is_empty());
-    assert!(cli.commands.is_empty());
+    assert!(cli.setup.hooks.is_empty());
+    assert!(cli.setup.mcp.is_empty());
+    assert!(cli.setup.commands.is_empty());
 }
 
 #[test]
 fn cli_repeated_flag() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--mcp", "a", "--mcp", "b"]).unwrap();
-    assert_eq!(cli.mcp, vec!["a", "b"]);
+    assert_eq!(cli.setup.mcp, vec!["a", "b"]);
 }
 
 #[test]
 fn cli_languages_positional() {
     let cli = Cli::try_parse_from(["clemp", "ts", "python", "rust"]).unwrap();
-    assert_eq!(cli.languages, vec!["ts", "python", "rust"]);
+    assert_eq!(cli.setup.languages, vec!["ts", "python", "rust"]);
 }
 
 #[test]
 fn cli_no_languages() {
     let cli = Cli::try_parse_from(["clemp"]).unwrap();
-    assert!(cli.languages.is_empty());
+    assert!(cli.setup.languages.is_empty());
 }
 
 #[test]
@@ -128,10 +128,10 @@ fn cli_all_options_combined() {
         "deploy",
     ])
     .unwrap();
-    assert_eq!(cli.languages, vec!["ts", "python"]);
-    assert_eq!(cli.hooks, vec!["sound", "lint"]);
-    assert_eq!(cli.mcp, vec!["context7", "sequential-thinking"]);
-    assert_eq!(cli.commands, vec!["review", "deploy"]);
+    assert_eq!(cli.setup.languages, vec!["ts", "python"]);
+    assert_eq!(cli.setup.hooks, vec!["sound", "lint"]);
+    assert_eq!(cli.setup.mcp, vec!["context7", "sequential-thinking"]);
+    assert_eq!(cli.setup.commands, vec!["review", "deploy"]);
 }
 
 #[test]
@@ -145,14 +145,14 @@ fn cli_double_dash_separates_positionals() {
         "python",
     ])
     .unwrap();
-    assert_eq!(cli.mcp, vec!["context7"]);
-    assert_eq!(cli.languages, vec!["ts", "python"]);
+    assert_eq!(cli.setup.mcp, vec!["context7"]);
+    assert_eq!(cli.setup.languages, vec!["ts", "python"]);
 }
 
 #[test]
 fn cli_hooks_mixed_comma_and_space() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--hooks", "a,b", "c"]).unwrap();
-    assert_eq!(cli.hooks, vec!["a", "b", "c"]);
+    assert_eq!(cli.setup.hooks, vec!["a", "b", "c"]);
 }
 
 // ── --commands parsing ───────────────────────────────────────────────────
@@ -161,20 +161,20 @@ fn cli_hooks_mixed_comma_and_space() {
 fn cli_commands_space_separated() {
     let cli =
         Cli::try_parse_from(["clemp", "ts", "--commands", "review", "deploy"]).unwrap();
-    assert_eq!(cli.commands, vec!["review", "deploy"]);
+    assert_eq!(cli.setup.commands, vec!["review", "deploy"]);
 }
 
 #[test]
 fn cli_commands_comma_separated() {
     let cli =
         Cli::try_parse_from(["clemp", "ts", "--commands", "review,deploy"]).unwrap();
-    assert_eq!(cli.commands, vec!["review", "deploy"]);
+    assert_eq!(cli.setup.commands, vec!["review", "deploy"]);
 }
 
 #[test]
 fn cli_commands_mixed_comma_and_space() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--commands", "a,b", "c"]).unwrap();
-    assert_eq!(cli.commands, vec!["a", "b", "c"]);
+    assert_eq!(cli.setup.commands, vec!["a", "b", "c"]);
 }
 
 // ── --clarg parsing ─────────────────────────────────────────────────────
@@ -182,13 +182,13 @@ fn cli_commands_mixed_comma_and_space() {
 #[test]
 fn cli_clarg_single_value() {
     let cli = Cli::try_parse_from(["clemp", "ts", "--clarg", "strict"]).unwrap();
-    assert_eq!(cli.clarg.as_deref(), Some("strict"));
+    assert_eq!(cli.setup.clarg.as_deref(), Some("strict"));
 }
 
 #[test]
 fn cli_clarg_not_specified() {
     let cli = Cli::try_parse_from(["clemp", "ts"]).unwrap();
-    assert!(cli.clarg.is_none());
+    assert!(cli.setup.clarg.is_none());
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn cli_clarg_combined_with_other_options() {
         "strict",
     ])
     .unwrap();
-    assert_eq!(cli.clarg.as_deref(), Some("strict"));
-    assert_eq!(cli.hooks, vec!["sound"]);
-    assert_eq!(cli.mcp, vec!["context7"]);
+    assert_eq!(cli.setup.clarg.as_deref(), Some("strict"));
+    assert_eq!(cli.setup.hooks, vec!["sound"]);
+    assert_eq!(cli.setup.mcp, vec!["context7"]);
 }
