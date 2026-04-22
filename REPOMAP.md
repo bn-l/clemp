@@ -12,7 +12,7 @@
   - `.gitignore` is **never** hash-tracked in the lockfile — it's append-only and user-owned. `update_gitignore` is idempotent and called separately in the update apply phase.
   - Lockfile keys are normalized to forward-slash form via `lockfile_key`. All manifest lookups go through this normalization.
   - New lockfile manifest after `clemp update` uses **template-render hashes** (from the staging dir), not on-disk CWD hashes. This preserves the invariant: "lockfile hash = what clemp last wrote; any deviation on disk = user modification."
-  - Language resolution in `resolve_language` checks 5 conditional dirs: `commands`, `skills`, `copied`, `mcp`, `githooks`. `resolve_all_languages` dedupes by canonical name so `ts` and `typescript` collapse to a single `typescript` entry; `OriginalCommand::merge_additive` applies the same alias-aware dedup when unioning stored language lists across updates.
+  - Language resolution in `resolve_language` checks 5 conditional dirs (`commands`, `skills`, `copied`, `mcp`, `githooks`) plus the file `gitignore-additions/<canonical>.gitignore`. `resolve_all_languages` dedupes by canonical name so `ts` and `typescript` collapse to a single `typescript` entry; `OriginalCommand::merge_additive` applies the same alias-aware dedup when unioning stored language lists across updates.
   - MCP assembly merges 3 layers in order: `default/` → language dirs → `--mcp` named files. Later layers override.
 
 ### Types & Schemas
@@ -38,7 +38,7 @@
   - `--prune-stale` — delete files the template no longer produces without prompting
   - `--restore-deleted` — re-copy files the user removed from disk
   - `--force` — skip interactive Claude merge, overwrite conflicts with template version
-- `clemp list [CATEGORY]` — list available template files. `CATEGORY` is one of `mcp`, `hooks`, `commands`, `githooks`, `clarg`, `languages`; omit for all categories with headers.
+- `clemp list [CATEGORY]` — list available template files. `CATEGORY` is one of `mcp`, `hooks`, `commands`, `githooks`, `clarg`, `gitignore`, `languages`; omit for all categories with headers.
 - `-v` / `--version` — top-level, prints version from `Cargo.toml`
 
 **Template Rendering** (`render_claude_md` in `src/lib.rs`)
@@ -66,6 +66,12 @@
 **Conditional Dirs** (`copy_conditional_dir` in `src/lib.rs`)
 - Pattern: `<source_dir>/default/` + `<source_dir>/<lang>/` → merged into dest (lang overrides default)
 - Applied to: `commands` → `<dest>/.claude/commands`, `skills` → `<dest>/.claude/skills`, `copied` → `<dest>` (dest root)
+
+**Gitignore Additions** (`update_gitignore` in `src/lib.rs`)
+- Sources: `gitignore-additions/default.gitignore` (always) + `gitignore-additions/<lang>.gitignore` for each resolved language (in user-provided order)
+- Merge: concat default + lang fragments → trim → drop blanks → dedupe against existing `.gitignore` lines AND against earlier fragments → append remaining lines under a `# Claude related` header
+- Missing dir, missing files, and empty fragments are silent no-ops
+- `.gitignore` is **not** hash-tracked in the lockfile (see Architectural Rules)
 
 **Git Hooks** (`copy_conditional_githooks` + `copy_named_githooks` in `src/lib.rs`)
 - Sources: `githooks/default/` + `githooks/<lang>/` (conditional) + `githooks/<name>` (named, extensionless files at root)
@@ -107,8 +113,8 @@
 **Listing** (`list_category` + `list_available` in `src/lib.rs`)
 - `list_category` scans a single category dir for named/opt-in files, returns sorted `Vec<String>`
 - `list_available` formats output: "all" mode prints headers per non-empty category; single-category mode prints bare names
-- Categories → dir + extension filter: `mcp/*.json`, `hooks/*.json`, `commands/*.md`, `githooks/*` (any file), `clarg/*.yaml|yml`, `claude-md/lang-rules/*.md`
-- Only root-level files are listed (subdirs like `default/` and language dirs are excluded via `is_file()` filter)
+- Categories → dir + extension filter: `mcp/*.json`, `hooks/*.json`, `commands/*.md`, `githooks/*` (any file), `clarg/*.yaml|yml`, `gitignore-additions/*.gitignore` (excluding `default`), `claude-md/lang-rules/*.md`
+- Only root-level files are listed (subdirs like `default/` and language dirs are excluded via `is_file()` filter); the gitignore category additionally drops the `default` stem so only per-language fragments are surfaced
 - Invoked via `clemp list [CATEGORY]` (subcommand); `main.rs::run_list` clones, lists, and removes the clone dir — never touches CWD
 
 **Config Persistence** (`load_config` / `save_config` in `src/lib.rs`)
@@ -124,6 +130,7 @@
 - Command files: `commands/default/<name>.md` for always-on, `commands/<lang>/<name>.md` for language-matched, `commands/<name>.md` for opt-in via `--commands`
 - MCP files: `mcp/default/<name>.json` for always-on, `mcp/<lang>/<name>.json` for language-matched, `mcp/<name>.json` for opt-in via `--mcp`
 - Git hook files: `githooks/default/<name>` for always-on, `githooks/<lang>/<name>` for language-matched, `githooks/<name>` for opt-in via `--githooks` (extensionless)
+- Gitignore fragments: `gitignore-additions/default.gitignore` (always applied), `gitignore-additions/<canonical>.gitignore` (applied when that language resolves)
 - Language rules: `claude-md/lang-rules/<canonical>.md`
 - MCP rules: `claude-md/mcp-rules/<name>.md`
 - Misc template sections: `claude-md/misc/<tag-name>.md` or `<tag-name>.md.jinja` — hyphens become underscores in template variable names
