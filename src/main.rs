@@ -5,7 +5,8 @@ use anyhow::Result;
 use clap::Parser;
 use clemp::{
     cleanup, clone_repo, compute_manifest, get_repo_url, list_available, normalize_setup_args,
-    run_setup, run_update, Cli, CliCommand, Lockfile, OriginalCommand, CLONE_DIR, LOCKFILE_NAME,
+    reject_add_drop_overlap, resolve_all_languages, run_setup, run_update, validate_fresh_additions,
+    Cli, CliCommand, Lockfile, OriginalCommand, RenderInputs, Resolved, CLONE_DIR, LOCKFILE_NAME,
 };
 use std::fs;
 use std::path::Path;
@@ -58,12 +59,35 @@ fn run_setup_cmd(args: clemp::SetupArgs, clone_dir: &Path) -> Result<()> {
     let install_git_hooks = Path::new(".git").is_dir();
 
     let result = (|| {
-        let resolved = run_setup(&args, clone_dir, cwd, true, install_git_hooks)?;
-        let files = compute_manifest(&args, &resolved, clone_dir, cwd)?;
+        // CLI-boundary validation before any files are touched. Overlap
+        // rejection mirrors the within-invocation guard in `merge_additive`;
+        // `validate_fresh_additions` catches typos in --mcp / --hooks /
+        // --drop-*.
+        let setup_command = OriginalCommand::from_setup(&args);
+        reject_add_drop_overlap(&setup_command)?;
+        let resolved_languages = resolve_all_languages(&args.languages, clone_dir)?;
+        validate_fresh_additions(
+            &OriginalCommand::default(),
+            &setup_command,
+            &resolved_languages,
+            None,
+            clone_dir,
+        )?;
+        let inputs = RenderInputs {
+            setup: &args,
+            sticky_mcp: &[],
+            sticky_hooks: &[],
+        };
+        let outcome = run_setup(&inputs, clone_dir, cwd, true, install_git_hooks)?;
+        let files = compute_manifest(&args, &outcome.resolved_languages, clone_dir, cwd)?;
         Lockfile {
             template_repo: repo_url.clone(),
             template_sha: template_sha.clone(),
             original_command: OriginalCommand::from_setup(&args),
+            resolved: Some(Resolved {
+                mcp: outcome.mcp_snapshottable_stems,
+                hooks: outcome.hooks_snapshottable_stems,
+            }),
             files,
         }
         .save(cwd)?;

@@ -5,9 +5,13 @@ mod common;
 
 use clemp::{
     cleanup, collect_conditional_dir_sources, collect_conflicts, collect_copy_files_sources,
-    copy_conditional_dir, copy_dir_recursive, copy_files, run_setup, update_gitignore, SetupArgs,
-    CLONE_DIR,
+    copy_conditional_dir, copy_dir_recursive, copy_files, run_setup, update_gitignore,
+    RenderInputs, SetupArgs, CLONE_DIR,
 };
+
+fn ri<'a>(args: &'a SetupArgs) -> RenderInputs<'a> {
+    RenderInputs { setup: args, sticky_mcp: &[], sticky_hooks: &[] }
+}
 use common::{setup_gitignore_test, setup_gitignore_test_with_langs, CwdGuard, Scaffold};
 use serde_json::Value;
 use std::fs;
@@ -702,15 +706,10 @@ fn run_setup_full_flow() {
 
     let args = SetupArgs {
         languages: vec!["ts".into()],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
+        ..Default::default()
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&args), s.path(), Path::new("."), true, false).unwrap();
 
     // .gitignore created with additions
     let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
@@ -808,17 +807,9 @@ fn run_setup_aborts_cleanly_on_copy_files_conflict() {
     // Pre-existing CLAUDE.md in CWD — will conflict with copy_files
     fs::write(workdir.path().join("CLAUDE.md"), "existing").unwrap();
 
-    let args = SetupArgs {
-        languages: vec![],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
-    };
+    let args = SetupArgs::default();
 
-    let result = run_setup(&args, s.path(), Path::new("."), true, false);
+    let result = run_setup(&ri(&args), s.path(), Path::new("."), true, false);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("CLAUDE.md"));
 
@@ -848,17 +839,9 @@ fn run_setup_aborts_cleanly_on_copied_dir_conflict() {
     // Pre-existing AGENTS.md — will conflict with copy_conditional_dir(copied/)
     fs::write(workdir.path().join("AGENTS.md"), "existing").unwrap();
 
-    let args = SetupArgs {
-        languages: vec![],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
-    };
+    let args = SetupArgs::default();
 
-    let result = run_setup(&args, s.path(), Path::new("."), true, false);
+    let result = run_setup(&ri(&args), s.path(), Path::new("."), true, false);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("AGENTS.md"));
 
@@ -973,13 +956,10 @@ fn run_setup_with_named_hooks_and_mcps() {
         languages: vec!["ts".into()],
         hooks: vec!["blocker".into()],
         mcp: vec!["maps".into()],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
+        ..Default::default()
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&args), s.path(), Path::new("."), true, false).unwrap();
 
     // Settings has both default + blocker hooks merged
     let settings: Value = serde_json::from_str(
@@ -1034,15 +1014,10 @@ fn run_setup_with_lang_conditionals() {
 
     let args = SetupArgs {
         languages: vec!["svelte".into()],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
+        ..Default::default()
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&args), s.path(), Path::new("."), true, false).unwrap();
 
     // Commands
     assert!(workdir.path().join(".claude/commands/base.md").exists());
@@ -1089,15 +1064,10 @@ fn run_setup_multiple_languages() {
 
     let args = SetupArgs {
         languages: vec!["ts".into(), "svelte".into()],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
+        ..Default::default()
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&args), s.path(), Path::new("."), true, false).unwrap();
 
     // CLAUDE.md contains both language rules
     let claude = fs::read_to_string(workdir.path().join("CLAUDE.md")).unwrap();

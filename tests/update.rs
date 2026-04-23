@@ -6,8 +6,8 @@
 mod common;
 
 use clemp::{
-    compute_manifest, run_setup, run_update, Lockfile, OriginalCommand, SetupArgs, UpdateArgs,
-    LOCKFILE_NAME,
+    compute_manifest, run_setup, run_update, Lockfile, OriginalCommand, RenderInputs, Resolved,
+    SetupArgs, UpdateArgs, LOCKFILE_NAME,
 };
 use common::{install_fake_claude, CwdGuard, EnvVarGuard, PathGuard, Scaffold};
 use std::fs;
@@ -54,17 +54,28 @@ fn ts_update(force: bool, prune_stale: bool, restore_deleted: bool) -> UpdateArg
 /// Returns the resolved language list (for callers that want to recompute).
 fn setup_and_lock(s: &Scaffold, sha: &str) -> Vec<String> {
     let args = ts_args();
-    let resolved = run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
-    let manifest = compute_manifest(&args, &resolved, s.path(), Path::new(".")).unwrap();
+    let outcome = run_setup(
+        &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
+    let manifest = compute_manifest(&args, &outcome.resolved_languages, s.path(), Path::new(".")).unwrap();
     Lockfile {
         template_repo: REPO_URL.into(),
         template_sha: sha.into(),
         original_command: OriginalCommand::from_setup(&args),
+        resolved: Some(Resolved {
+            mcp: outcome.mcp_snapshottable_stems,
+            hooks: outcome.hooks_snapshottable_stems,
+        }),
         files: manifest,
     }
     .save(Path::new("."))
     .unwrap();
-    resolved
+    outcome.resolved_languages
 }
 
 // ── 1. Clean update propagates template changes ─────────────────────────
@@ -593,12 +604,25 @@ fn git_hook_update_preserves_executable_bit() {
             languages: vec!["ts".into()],
             ..Default::default()
         };
-        let resolved = run_setup(&args, v1.path(), Path::new("."), true, true).unwrap();
-        let manifest = compute_manifest(&args, &resolved, v1.path(), Path::new(".")).unwrap();
+        let outcome = run_setup(
+            &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+            v1.path(),
+            Path::new("."),
+            true,
+            true,
+        )
+        .unwrap();
+        let manifest =
+            compute_manifest(&args, &outcome.resolved_languages, v1.path(), Path::new("."))
+                .unwrap();
         Lockfile {
             template_repo: REPO_URL.into(),
             template_sha: V1_SHA.into(),
             original_command: OriginalCommand::from_setup(&args),
+            resolved: Some(Resolved {
+                mcp: outcome.mcp_snapshottable_stems,
+                hooks: outcome.hooks_snapshottable_stems,
+            }),
             files: manifest,
         }
         .save(Path::new("."))
@@ -841,4 +865,595 @@ fn update_adds_language_with_only_gitignore_fragment() {
     let langs = &lock.original_command.languages;
     assert!(langs.iter().any(|l| l == "ts"), "ts kept: {langs:?}");
     assert!(langs.iter().any(|l| l == "python"), "python added: {langs:?}");
+}
+
+// ── Snapshot / sticky reproducibility coverage ──────────────────────────
+
+/// Set up v1 with `extra_named_mcps` additionally present at `mcp/<stem>.json`,
+/// opt into them via `--mcp`, and persist a lockfile pinned to `V1_SHA`.
+fn setup_and_lock_with_named_mcps(
+    s: &Scaffold,
+    named: &[(&str, &str)],
+    args: &SetupArgs,
+) {
+    s.with_named_mcps(named);
+    let outcome = run_setup(
+        &RenderInputs { setup: args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
+    let manifest =
+        compute_manifest(args, &outcome.resolved_languages, s.path(), Path::new(".")).unwrap();
+    Lockfile {
+        template_repo: REPO_URL.into(),
+        template_sha: V1_SHA.into(),
+        original_command: OriginalCommand::from_setup(args),
+        resolved: Some(Resolved {
+            mcp: outcome.mcp_snapshottable_stems,
+            hooks: outcome.hooks_snapshottable_stems,
+        }),
+        files: manifest,
+    }
+    .save(Path::new("."))
+    .unwrap();
+}
+
+#[test]
+fn prune_stale_drops_opt_in_from_original_command_and_snapshot() {
+    // Regression for P1: when `--prune-stale` removes a stale contributor,
+    // its stem must also disappear from `original_command.<kind>` so the next
+    // render's assembler doesn't try to resolve it via the user_named path
+    // (which would bail "MCP not found" since it's gone from the template).
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        let args = SetupArgs {
+            languages: vec!["ts".into()],
+            mcp: vec!["foo".into()],
+            ..Default::default()
+        };
+        setup_and_lock_with_named_mcps(
+            &v1,
+            &[("foo", r#"{"foo": {"url": "foo-v1"}}"#)],
+            &args,
+        );
+    }
+
+    let lock_pre = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        lock_pre.original_command.mcp.contains(&"foo".to_string()),
+        "pre: foo is historical in original_command.mcp"
+    );
+    assert!(
+        lock_pre.resolved.as_ref().unwrap().mcp.contains(&"foo".to_string()),
+        "pre: foo is pinned in the snapshot"
+    );
+
+    // v2 removes foo from the template entirely.
+    let v2 = build_scaffold("v2 ts rules\n");
+
+    run_update(&ts_update(false, true, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let lock_post = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        !lock_post.original_command.mcp.contains(&"foo".to_string()),
+        "--prune-stale must strip foo from original_command.mcp, got {:?}",
+        lock_post.original_command.mcp
+    );
+    let resolved_post = lock_post.resolved.unwrap().mcp;
+    assert!(
+        !resolved_post.contains(&"foo".to_string()),
+        "--prune-stale must strip foo from resolved.mcp, got {resolved_post:?}"
+    );
+    assert_eq!(lock_post.template_sha, V2_SHA);
+}
+
+#[test]
+fn fresh_mcp_flag_rejected_when_stem_only_exists_under_language_dir() {
+    // Regression for P2: fresh positive --mcp validation must be root-only.
+    // Accepting a language-layer stem would pin it as sticky and defeat the
+    // "language layers stay dynamic" invariant.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        setup_and_lock(&v1, V1_SHA);
+    }
+
+    // v2 introduces `bar` ONLY under mcp/typescript/bar.json.
+    let v2 = build_scaffold("v2 ts rules\n");
+    v2.with_lang_mcps("typescript", &[("bar", r#"{"bar": {"url": "b"}}"#)]);
+
+    let update = UpdateArgs {
+        setup: SetupArgs {
+            languages: vec!["ts".into()],
+            mcp: vec!["bar".into()],
+            ..Default::default()
+        },
+        prune_stale: false,
+        restore_deleted: false,
+    };
+
+    let err = run_update(&update, v2.path(), V2_SHA, REPO_URL)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("MCP 'bar'") && err.contains("mcp/bar.json"),
+        "fresh --mcp on language-only stem must complain about missing root opt-in: {err}"
+    );
+
+    // Lockfile must not have advanced.
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert_eq!(lock.template_sha, V1_SHA);
+    assert!(lock.original_command.mcp.is_empty());
+}
+
+#[test]
+fn old_lockfile_without_resolved_bypasses_fast_path_and_writes_snapshot() {
+    // Pre-snapshot lockfiles have `resolved: None`. The same-SHA + same-args
+    // no-op fast path must NOT trigger for them — otherwise those projects
+    // could never capture their snapshot without a template change.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    let v1 = build_scaffold("v1 ts rules\n");
+    setup_and_lock(&v1, V1_SHA);
+
+    // Downgrade the lockfile to pre-snapshot schema.
+    {
+        let mut lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+        lock.resolved = None;
+        lock.save(Path::new(".")).unwrap();
+    }
+    assert!(
+        Lockfile::load(Path::new(".")).unwrap().unwrap().resolved.is_none(),
+        "pre: lockfile has no resolved block"
+    );
+
+    // Same SHA, same args, no restore flag. Fast-path would short-circuit
+    // unless `snapshot_missing` forces a full pass.
+    run_update(&ts_update(false, false, false), v1.path(), V1_SHA, REPO_URL).unwrap();
+
+    let after = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    let resolved = after
+        .resolved
+        .expect("resolved must be populated after migration update");
+    assert!(
+        resolved.mcp.contains(&"context7".to_string()),
+        "default-layer MCP must land in snapshot on first post-migration update, got {resolved:?}"
+    );
+}
+
+#[test]
+fn sticky_opt_in_preserved_when_contributor_moves_root_to_default() {
+    // User opted into `extra` when it lived at the root layer. Template
+    // relocates it to the default layer. The aggregation still includes it
+    // (now via default) and the snapshot continues to pin the opt-in so a
+    // later template flip back wouldn't lose the user's intent.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        let args = SetupArgs {
+            languages: vec!["ts".into()],
+            mcp: vec!["extra".into()],
+            ..Default::default()
+        };
+        setup_and_lock_with_named_mcps(
+            &v1,
+            &[("extra", r#"{"extra": {"url": "e1"}}"#)],
+            &args,
+        );
+    }
+
+    let mcp_pre = fs::read_to_string(".mcp.json").unwrap();
+    assert!(mcp_pre.contains("\"extra\""), "pre: {mcp_pre}");
+
+    // v2 moves extra: mcp/extra.json → mcp/default/extra.json.
+    let v2 = build_scaffold("v2 ts rules\n");
+    v2.with_default_mcps(&[("extra", r#"{"extra": {"url": "e2"}}"#)]);
+
+    run_update(&ts_update(false, false, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let mcp_post = fs::read_to_string(".mcp.json").unwrap();
+    assert!(
+        mcp_post.contains("\"extra\""),
+        "extra must survive the root→default move: {mcp_post}"
+    );
+
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    let resolved_mcp = lock.resolved.unwrap().mcp;
+    assert!(
+        resolved_mcp.contains(&"extra".to_string()),
+        "explicit opt-in must stay sticky across root→default move, got {resolved_mcp:?}"
+    );
+    assert!(
+        lock.original_command.mcp.contains(&"extra".to_string()),
+        "original_command.mcp must still hold the opt-in"
+    );
+}
+
+/// Setup helper that seeds a root-level named hook, opts into it, and writes
+/// the resulting lockfile pinned to `V1_SHA`.
+fn setup_and_lock_with_named_hooks(
+    s: &Scaffold,
+    named: &[(&str, &str)],
+    args: &SetupArgs,
+) {
+    s.with_named_hooks(named);
+    let outcome = run_setup(
+        &RenderInputs { setup: args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
+    let manifest =
+        compute_manifest(args, &outcome.resolved_languages, s.path(), Path::new(".")).unwrap();
+    Lockfile {
+        template_repo: REPO_URL.into(),
+        template_sha: V1_SHA.into(),
+        original_command: OriginalCommand::from_setup(args),
+        resolved: Some(Resolved {
+            mcp: outcome.mcp_snapshottable_stems,
+            hooks: outcome.hooks_snapshottable_stems,
+        }),
+        files: manifest,
+    }
+    .save(Path::new("."))
+    .unwrap();
+}
+
+// ── Drop-flag e2e coverage ──────────────────────────────────────────────
+
+#[test]
+fn update_with_drop_mcp_excludes_default_contributor() {
+    // `--drop-mcp context7` on a default always-on contributor must remove it
+    // from the rendered .mcp.json AND keep it out of the snapshot so the
+    // exclusion survives future updates.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        setup_and_lock(&v1, V1_SHA);
+    }
+    let pre = fs::read_to_string(".mcp.json").unwrap();
+    assert!(pre.contains("\"context7\""), "pre: default mcp present");
+
+    let v2 = build_scaffold("v2 ts rules\n");
+
+    let update = UpdateArgs {
+        setup: SetupArgs {
+            languages: vec!["ts".into()],
+            drop_mcp: vec!["context7".into()],
+            ..Default::default()
+        },
+        prune_stale: false,
+        restore_deleted: false,
+    };
+    run_update(&update, v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let post = fs::read_to_string(".mcp.json").unwrap();
+    assert!(
+        !post.contains("\"context7\""),
+        "--drop-mcp context7 must exclude the default contributor: {post}"
+    );
+
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        lock.original_command.drop_mcp.contains(&"context7".to_string()),
+        "drop must persist: {:?}",
+        lock.original_command.drop_mcp
+    );
+    let resolved_mcp = lock.resolved.unwrap().mcp;
+    assert!(
+        !resolved_mcp.contains(&"context7".to_string()),
+        "dropped default must NOT land in snapshot: {resolved_mcp:?}"
+    );
+}
+
+#[test]
+fn update_mcp_flag_undrops_previously_dropped_default_contributor() {
+    // Exercises the full persisted-drop → newer-add undrop cycle end-to-end.
+    // Also guards the `FRESH_POSITIVE_LAYERS` widening: if validation stayed
+    // root-only, `--mcp context7` would bail here even though merge_additive
+    // is documented to clear the persisted drop.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        let args = SetupArgs {
+            languages: vec!["ts".into()],
+            drop_mcp: vec!["context7".into()],
+            ..Default::default()
+        };
+        let outcome = run_setup(
+            &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+            v1.path(),
+            Path::new("."),
+            true,
+            false,
+        )
+        .unwrap();
+        let manifest =
+            compute_manifest(&args, &outcome.resolved_languages, v1.path(), Path::new(".")).unwrap();
+        Lockfile {
+            template_repo: REPO_URL.into(),
+            template_sha: V1_SHA.into(),
+            original_command: OriginalCommand::from_setup(&args),
+            resolved: Some(Resolved {
+                mcp: outcome.mcp_snapshottable_stems,
+                hooks: outcome.hooks_snapshottable_stems,
+            }),
+            files: manifest,
+        }
+        .save(Path::new("."))
+        .unwrap();
+    }
+    let pre = fs::read_to_string(".mcp.json").unwrap();
+    assert!(
+        !pre.contains("\"context7\""),
+        "pre: dropped default must be absent, got {pre}"
+    );
+
+    let v2 = build_scaffold("v2 ts rules\n");
+    let update = UpdateArgs {
+        setup: SetupArgs {
+            languages: vec!["ts".into()],
+            mcp: vec!["context7".into()],
+            ..Default::default()
+        },
+        prune_stale: false,
+        restore_deleted: false,
+    };
+    run_update(&update, v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let post = fs::read_to_string(".mcp.json").unwrap();
+    assert!(
+        post.contains("\"context7\""),
+        "--mcp must undrop the default contributor, got {post}"
+    );
+
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        lock.original_command.mcp.contains(&"context7".to_string()),
+        "newer --mcp must land in original_command.mcp"
+    );
+    assert!(
+        !lock.original_command.drop_mcp.contains(&"context7".to_string()),
+        "persisted drop must be cleared after undrop, got {:?}",
+        lock.original_command.drop_mcp
+    );
+    assert!(
+        lock.resolved.unwrap().mcp.contains(&"context7".to_string()),
+        "undropped contributor must reappear in the snapshot"
+    );
+}
+
+// ── Hook snapshot coverage ──────────────────────────────────────────────
+
+#[test]
+fn prune_stale_drops_hook_opt_in_from_original_command_and_snapshot() {
+    // Hook parallel to the MCP prune-stale opt-in test. Guards the symmetric
+    // half of the P1 fix — the stale retain pass for hooks.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        let args = SetupArgs {
+            languages: vec!["ts".into()],
+            hooks: vec!["notify".into()],
+            ..Default::default()
+        };
+        setup_and_lock_with_named_hooks(
+            &v1,
+            &[(
+                "notify",
+                r#"{"PreToolUse": [{"type":"command","command":"echo v1"}]}"#,
+            )],
+            &args,
+        );
+    }
+
+    let lock_pre = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        lock_pre.original_command.hooks.contains(&"notify".to_string()),
+        "pre: notify persisted in original_command.hooks"
+    );
+    assert!(
+        lock_pre
+            .resolved
+            .as_ref()
+            .unwrap()
+            .hooks
+            .contains(&"notify".to_string()),
+        "pre: notify pinned in snapshot"
+    );
+
+    // v2 removes hooks/notify.json entirely.
+    let v2 = build_scaffold("v2 ts rules\n");
+
+    run_update(&ts_update(false, true, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let lock_post = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        !lock_post.original_command.hooks.contains(&"notify".to_string()),
+        "--prune-stale must strip notify from original_command.hooks, got {:?}",
+        lock_post.original_command.hooks
+    );
+    let resolved_hooks = lock_post.resolved.unwrap().hooks;
+    assert!(
+        !resolved_hooks.contains(&"notify".to_string()),
+        "--prune-stale must strip notify from resolved.hooks, got {resolved_hooks:?}"
+    );
+    assert_eq!(lock_post.template_sha, V2_SHA);
+}
+
+#[test]
+fn sticky_hook_opt_in_preserved_when_contributor_moves_root_to_default() {
+    // Hook parallel to the MCP root→default sticky test. Exercises the
+    // already-satisfied branch of assemble_hooks_json.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        let args = SetupArgs {
+            languages: vec!["ts".into()],
+            hooks: vec!["notify".into()],
+            ..Default::default()
+        };
+        setup_and_lock_with_named_hooks(
+            &v1,
+            &[(
+                "notify",
+                r#"{"PreToolUse": [{"type":"command","command":"echo v1"}]}"#,
+            )],
+            &args,
+        );
+    }
+
+    let settings_pre =
+        fs::read_to_string(".claude/settings.local.json").unwrap();
+    assert!(
+        settings_pre.contains("echo v1"),
+        "pre: notify hook entry present: {settings_pre}"
+    );
+
+    // v2 relocates the hook from hooks/notify.json → hooks/default/notify.json.
+    let v2 = build_scaffold("v2 ts rules\n");
+    v2.with_default_hooks(&[(
+        "notify",
+        r#"{"PreToolUse": [{"type":"command","command":"echo v2"}]}"#,
+    )]);
+
+    run_update(&ts_update(false, false, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let settings_post =
+        fs::read_to_string(".claude/settings.local.json").unwrap();
+    assert!(
+        settings_post.contains("echo v2"),
+        "hook must survive root→default relocation: {settings_post}"
+    );
+
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    let resolved_hooks = lock.resolved.unwrap().hooks;
+    assert!(
+        resolved_hooks.contains(&"notify".to_string()),
+        "explicit hook opt-in must stay sticky across root→default move, got {resolved_hooks:?}"
+    );
+    assert!(
+        lock.original_command.hooks.contains(&"notify".to_string()),
+        "original_command.hooks must still hold the opt-in"
+    );
+}
+
+#[test]
+fn sticky_default_hook_preserved_when_relocated_to_root() {
+    // Symmetric to the MCP default→root case for hooks. Exercises
+    // assemble_hooks_json's move-fallback branch: default-layer hook was
+    // snapshotted without any --hooks flag; template relocates it to root.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        v1.with_default_hooks(&[(
+            "watchdog",
+            r#"{"PreToolUse": [{"type":"command","command":"echo v1"}]}"#,
+        )]);
+        setup_and_lock(&v1, V1_SHA);
+    }
+    let lock_pre = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        lock_pre
+            .resolved
+            .unwrap()
+            .hooks
+            .contains(&"watchdog".to_string()),
+        "pre: watchdog snapshotted from default layer"
+    );
+    assert!(
+        lock_pre.original_command.hooks.is_empty(),
+        "pre: watchdog was never flagged — original_command.hooks empty"
+    );
+
+    // v2 moves watchdog to the root opt-in layer.
+    let v2 = build_scaffold("v2 ts rules\n");
+    v2.with_named_hooks(&[(
+        "watchdog",
+        r#"{"PreToolUse": [{"type":"command","command":"echo v2"}]}"#,
+    )]);
+
+    run_update(&ts_update(false, false, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let settings_post =
+        fs::read_to_string(".claude/settings.local.json").unwrap();
+    assert!(
+        settings_post.contains("echo v2"),
+        "watchdog must survive default→root relocation via sticky snapshot: {settings_post}"
+    );
+
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    let resolved_hooks = lock.resolved.unwrap().hooks;
+    assert!(
+        resolved_hooks.contains(&"watchdog".to_string()),
+        "snapshot must still pin watchdog after move-fallback resolved it at root, got {resolved_hooks:?}"
+    );
+}
+
+#[test]
+fn sticky_default_contributor_preserved_when_relocated_to_root() {
+    // Symmetric to the root→default case, but exercises the move-fallback
+    // branch of the assembler. A default-layer contributor gets snapshotted
+    // on initial setup without any --mcp flag; when the template relocates
+    // it to the root opt-in layer, the snapshot should keep it live even
+    // though no user_named flag ever pinned it.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        v1.with_default_mcps(&[("widget", r#"{"widget": {"url": "w1"}}"#)]);
+        setup_and_lock(&v1, V1_SHA);
+    }
+    let lock_pre = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert!(
+        lock_pre.resolved.unwrap().mcp.contains(&"widget".to_string()),
+        "pre: widget snapshotted from default layer"
+    );
+    assert!(
+        lock_pre.original_command.mcp.is_empty(),
+        "pre: widget was never flagged by the user — original_command.mcp empty"
+    );
+
+    // v2 moves widget to the root opt-in layer (no longer auto-applied).
+    let v2 = build_scaffold("v2 ts rules\n");
+    v2.with_named_mcps(&[("widget", r#"{"widget": {"url": "w2"}}"#)]);
+
+    run_update(&ts_update(false, false, false), v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    let mcp_post = fs::read_to_string(".mcp.json").unwrap();
+    assert!(
+        mcp_post.contains("\"widget\""),
+        "widget must survive default→root relocation via sticky snapshot: {mcp_post}"
+    );
+
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    let resolved_mcp = lock.resolved.unwrap().mcp;
+    assert!(
+        resolved_mcp.contains(&"widget".to_string()),
+        "snapshot must still pin widget after move-fallback resolved it at root, got {resolved_mcp:?}"
+    );
 }

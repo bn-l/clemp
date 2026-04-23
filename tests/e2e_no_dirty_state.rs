@@ -4,7 +4,11 @@
 
 mod common;
 
-use clemp::{run_setup, SetupArgs, CLONE_DIR};
+use clemp::{run_setup, RenderInputs, SetupArgs, CLONE_DIR};
+
+fn ri<'a>(args: &'a SetupArgs) -> RenderInputs<'a> {
+    RenderInputs { setup: args, sticky_mcp: &[], sticky_hooks: &[] }
+}
 use common::{CwdGuard, Scaffold};
 use std::collections::BTreeMap;
 use std::fs;
@@ -61,12 +65,7 @@ fn full_scaffold() -> Scaffold {
 fn default_cli() -> SetupArgs {
     SetupArgs {
         languages: vec!["ts".into()],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
+        ..Default::default()
     }
 }
 
@@ -86,7 +85,7 @@ fn assert_clean_abort(
     workdir: &Path,
     expected_substr: &str,
 ) {
-    let result = run_setup(args, clone_dir, Path::new("."), true, false);
+    let result = run_setup(&ri(args), clone_dir, Path::new("."), true, false);
     assert!(result.is_err(), "expected run_setup to fail");
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -189,7 +188,7 @@ fn multiple_conflicts_all_reported_cwd_clean() {
     fs::write(workdir.path().join(".editorconfig"), "x").unwrap();
     let before = snapshot_dir(workdir.path());
 
-    let result = run_setup(&default_cli(), s.path(), Path::new("."), true, false);
+    let result = run_setup(&ri(&default_cli()), s.path(), Path::new("."), true, false);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("CLAUDE.md"), "should mention CLAUDE.md: {msg}");
@@ -240,7 +239,7 @@ fn e2e_gitignore_applies_default_plus_lang() {
     s.with_gitignore_for_lang("typescript", "*.tsbuildinfo\n");
     let (workdir, _g) = setup_workdir(&s);
 
-    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&default_cli()), s.path(), Path::new("."), true, false).unwrap();
 
     let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains(".claude/"), "default applied:\n{gitignore}");
@@ -264,7 +263,7 @@ fn e2e_gitignore_lang_only_no_default_file() {
     s.with_gitignore_for_lang("typescript", "*.tsbuildinfo\n");
     let (workdir, _g) = setup_workdir(&s);
 
-    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&default_cli()), s.path(), Path::new("."), true, false).unwrap();
 
     let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(
@@ -279,7 +278,7 @@ fn e2e_gitignore_dir_excluded_from_copy() {
     s.with_gitignore_for_lang("typescript", "*.tsbuildinfo\n");
     let (workdir, _g) = setup_workdir(&s);
 
-    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&default_cli()), s.path(), Path::new("."), true, false).unwrap();
 
     // The gitignore-additions directory must not be copied into CWD.
     assert!(
@@ -309,14 +308,9 @@ fn e2e_gitignore_alias_resolves_to_canonical_fragment() {
 
     let args = SetupArgs {
         languages: vec!["js".into()],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
+        ..Default::default()
     };
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&args), s.path(), Path::new("."), true, false).unwrap();
 
     let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains(".claude/"), "{gitignore}");
@@ -344,15 +338,10 @@ fn e2e_gitignore_only_lang_resolves() {
 
     let args = SetupArgs {
         languages: vec!["ziglang".into()],
-        hooks: vec![],
-        mcp: vec![],
-        commands: vec![],
-        githooks: vec![],
-        clarg: None,
-        force: false,
+        ..Default::default()
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&args), s.path(), Path::new("."), true, false).unwrap();
 
     let gitignore = fs::read_to_string(workdir.path().join(".gitignore")).unwrap();
     assert!(gitignore.contains("zig-cache/"), "{gitignore}");
@@ -365,13 +354,13 @@ fn second_run_after_success_aborts_cleanly() {
     let (workdir, _g) = setup_workdir(&s);
 
     // First run succeeds
-    run_setup(&default_cli(), s.path(), Path::new("."), true, false).unwrap();
+    run_setup(&ri(&default_cli()), s.path(), Path::new("."), true, false).unwrap();
 
     // Snapshot CWD after successful first run
     let before = snapshot_dir(workdir.path());
 
     // Second run must fail (everything exists now) and leave CWD identical
-    let result = run_setup(&default_cli(), s.path(), Path::new("."), true, false);
+    let result = run_setup(&ri(&default_cli()), s.path(), Path::new("."), true, false);
     assert!(result.is_err());
 
     let after = snapshot_dir(workdir.path());
@@ -405,7 +394,7 @@ fn conflict_does_not_leave_clone_dir_artifacts_in_cwd() {
 
     fs::write(workdir.path().join(".mcp.json"), "conflict").unwrap();
 
-    let _ = run_setup(&default_cli(), s.path(), Path::new("."), true, false);
+    let _ = run_setup(&ri(&default_cli()), s.path(), Path::new("."), true, false);
 
     // Verify no artifacts leaked — these are built inside clone_dir during
     // phase 1 but must never reach CWD when phase 2 aborts.

@@ -101,6 +101,15 @@ pub struct SetupArgs {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub githooks: Vec<String>,
 
+    /// MCP server file stems to exclude from `.mcp.json` (opts out of a default
+    /// or a previously-sticky contributor). Comma or space separated.
+    #[arg(long = "drop-mcp", value_delimiter = ',', num_args = 1..)]
+    pub drop_mcp: Vec<String>,
+
+    /// Hook file stems to exclude from `.claude/settings.local.json`. Comma or space separated.
+    #[arg(long = "drop-hooks", value_delimiter = ',', num_args = 1..)]
+    pub drop_hooks: Vec<String>,
+
     /// Clarg config profile to enable (name of a YAML file in the template's clarg/ directory)
     #[arg(long)]
     pub clarg: Option<String>,
@@ -169,6 +178,13 @@ pub struct OriginalCommand {
     pub commands: Vec<String>,
     #[serde(default)]
     pub githooks: Vec<String>,
+    /// MCP contributor stems the user has explicitly excluded. Persisted so the
+    /// exclusion survives subsequent `clemp update` runs.
+    #[serde(default, rename = "drop-mcp")]
+    pub drop_mcp: Vec<String>,
+    /// Hook contributor stems the user has explicitly excluded.
+    #[serde(default, rename = "drop-hooks")]
+    pub drop_hooks: Vec<String>,
     #[serde(default)]
     pub clarg: Option<String>,
 }
@@ -181,6 +197,8 @@ impl OriginalCommand {
             mcp: args.mcp.clone(),
             commands: args.commands.clone(),
             githooks: args.githooks.clone(),
+            drop_mcp: args.drop_mcp.clone(),
+            drop_hooks: args.drop_hooks.clone(),
             clarg: args.clarg.clone(),
         }
     }
@@ -194,6 +212,8 @@ impl OriginalCommand {
             mcp: self.mcp,
             commands: self.commands,
             githooks: self.githooks,
+            drop_mcp: self.drop_mcp,
+            drop_hooks: self.drop_hooks,
             clarg: self.clarg,
             force: false,
         }
@@ -203,9 +223,15 @@ impl OriginalCommand {
     /// `clarg` is replaced only if `other.clarg` is `Some`. Vectors are unioned
     /// preserving insertion order, skipping duplicates. Languages are deduped
     /// against their canonical form so `ts` + `typescript` don't both land in
-    /// the merged command (which would otherwise produce duplicate lang-rule
-    /// sections and repeated conditional overlays during render).
-    pub fn merge_additive(&mut self, other: &OriginalCommand) {
+    /// the merged command.
+    ///
+    /// Positive/negative reconciliation: for each (`<kind>`, `drop_<kind>`)
+    /// pair, the **newer** invocation wins per stem. A stem in `other.mcp`
+    /// clears any existing `drop_mcp` entry for that stem and then unions into
+    /// `self.mcp` (and symmetrically the other way). Within a single
+    /// invocation, the same stem appearing in both `<kind>` and `drop_<kind>`
+    /// is a hard error.
+    pub fn merge_additive(&mut self, other: &OriginalCommand) -> Result<()> {
         fn union(a: &mut Vec<String>, b: &[String]) {
             for item in b {
                 if !a.contains(item) {
@@ -226,15 +252,60 @@ impl OriginalCommand {
                 }
             }
         }
+        reject_add_drop_overlap(other)?;
+
+        // Newer flag clears the opposing entry before the union.
+        self.drop_mcp.retain(|s| !other.mcp.contains(s));
+        self.mcp.retain(|s| !other.drop_mcp.contains(s));
+        self.drop_hooks.retain(|s| !other.hooks.contains(s));
+        self.hooks.retain(|s| !other.drop_hooks.contains(s));
+
         union_languages(&mut self.languages, &other.languages);
         union(&mut self.hooks, &other.hooks);
         union(&mut self.mcp, &other.mcp);
         union(&mut self.commands, &other.commands);
         union(&mut self.githooks, &other.githooks);
+        union(&mut self.drop_mcp, &other.drop_mcp);
+        union(&mut self.drop_hooks, &other.drop_hooks);
         if other.clarg.is_some() {
             self.clarg = other.clarg.clone();
         }
+        Ok(())
     }
+}
+
+/// Reject invocations where the same stem appears in both `<kind>` and
+/// `drop_<kind>`. Called from both initial setup (on the `SetupArgs`-derived
+/// command) and `merge_additive` (on the incoming side of the merge) so the
+/// "same-invocation add+drop is illegal" rule holds for every entry point.
+pub fn reject_add_drop_overlap(cmd: &OriginalCommand) -> Result<()> {
+    fn check(add: &[String], drop: &[String], label: &str) -> Result<()> {
+        for s in add {
+            if drop.contains(s) {
+                bail!(
+                    "'{s}' appears in both --{label} and --drop-{label} in the same invocation"
+                );
+            }
+        }
+        Ok(())
+    }
+    check(&cmd.mcp, &cmd.drop_mcp, "mcp")?;
+    check(&cmd.hooks, &cmd.drop_hooks, "hooks")?;
+    Ok(())
+}
+
+/// Symbolic snapshot of contributor *file stems* that fed aggregation outputs
+/// (`.mcp.json`, `.claude/settings.local.json`) during the last setup/update.
+/// Each entry is the `<stem>` of a `<kind>/**/<stem>.json` source file, not the
+/// top-level server/hook key inside the rendered JSON. Used by `clemp update`
+/// to keep existing projects pointed at sticky contributors even when a
+/// template author reorganises where the contributor is filed.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resolved {
+    #[serde(default)]
+    pub mcp: Vec<String>,
+    #[serde(default)]
+    pub hooks: Vec<String>,
 }
 
 /// Persisted at `.clemp-lock.yaml` in the project root after a successful
@@ -247,6 +318,12 @@ pub struct Lockfile {
     pub template_sha: String,
     #[serde(rename = "original-command")]
     pub original_command: OriginalCommand,
+    /// `None` on pre-snapshot lockfiles (missing field). Forces a full update
+    /// pass the first time an old lockfile is touched so `resolved` can be
+    /// populated. See `Resolved` and the migration fast-path guard in
+    /// `run_update`.
+    #[serde(default)]
+    pub resolved: Option<Resolved>,
     /// Relative path → sha256 hex digest of the file clemp wrote there.
     /// Paths are normalized to forward-slash form for cross-platform stability.
     pub files: BTreeMap<String, String>,
@@ -447,89 +524,408 @@ pub fn build_mcp_rules(active_mcps: &[String], claude_md_dir: &Path) -> Result<S
     Ok(sections.join("\n\n"))
 }
 
-// ── MCP assembly ─────────────────────────────────────────────────────────
+// ── Contributor resolution ───────────────────────────────────────────────
 
-/// Read all .json files from a directory and merge their top-level key-value pairs.
-fn read_json_dir(dir: &Path) -> Result<Map<String, Value>> {
-    let mut merged = Map::new();
-    if !dir.is_dir() {
-        return Ok(merged);
-    }
-    let mut entries: Vec<_> = fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "json")
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        let content = fs::read_to_string(&path)?;
-        let obj: Map<String, Value> = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-        merged.extend(obj);
-    }
-    Ok(merged)
+/// Which directory layers a kind's template authors use to file contributors.
+/// The resolver walks enabled layers in `default → lang → root` order.
+pub struct LayerSpec {
+    pub default: bool,
+    pub languages: bool,
+    pub root: bool,
 }
 
-/// Assemble .mcp.json from default/, language, and named MCP server files.
-/// Returns the assembled JSON and the list of all server names.
+pub const MCP_LAYERS: LayerSpec = LayerSpec { default: true, languages: true, root: true };
+/// Hooks today have no `hooks/<lang>/` dir in the template; keep the resolver
+/// honest. If lang-dirs for hooks are added later, flip `languages` to `true`.
+pub const HOOKS_LAYERS: LayerSpec = LayerSpec { default: true, languages: false, root: true };
+
+/// Layers consulted when validating a **fresh** positive add (a stem newly
+/// appearing in `merged.<kind>`). Default and root are allowed; language is
+/// blocked. Default is in because it supports the documented undrop semantics
+/// of `merge_additive`: after a persisted `--drop-<kind> context7`, a newer
+/// `--<kind> context7` clears the drop — but only makes sense if `context7`
+/// actually exists somewhere non-language in the template, which is usually
+/// `<kind>/default/`. Default-layer stems are already sticky via the default
+/// loop, so accepting them via user_named doesn't introduce a new snapshot
+/// surprise. Language is out because pinning a language-scoped stem as sticky
+/// would survive a later language drop and contradict the "language layers
+/// stay dynamic" invariant. Historical entries still use the broader
+/// `MCP_LAYERS` / `HOOKS_LAYERS` so the move-fallback story for
+/// previously-persisted opt-ins keeps working.
+pub const FRESH_POSITIVE_LAYERS: LayerSpec =
+    LayerSpec { default: true, languages: false, root: true };
+
+/// Locate the file that contributes `stem` under `<kind>/` for the enabled
+/// layers, in `default → lang → root` order. Returns `None` if no layer
+/// produces a hit. `kind` is the subdirectory name (`"mcp"` or `"hooks"`) and
+/// `ext` is the file extension without dot (`"json"` for both current kinds).
+pub fn resolve_contributor(
+    kind: &str,
+    ext: &str,
+    layers: &LayerSpec,
+    stem: &str,
+    languages: &[String],
+    clone_dir: &Path,
+) -> Option<PathBuf> {
+    let base = clone_dir.join(kind);
+    let filename = format!("{}.{}", stem, ext);
+    if layers.default {
+        let p = base.join("default").join(&filename);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if layers.languages {
+        for lang in languages {
+            let p = base.join(lang).join(&filename);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    if layers.root {
+        let p = base.join(&filename);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// All contributor stems available under any enabled layer of `kind`, used for
+/// error messages and drop-target validation. Deduped, insertion order: default
+/// stems first, then each resolved language's stems, then root-level stems.
+pub fn available_contributor_stems(
+    kind: &str,
+    ext: &str,
+    layers: &LayerSpec,
+    languages: &[String],
+    clone_dir: &Path,
+) -> Vec<String> {
+    let base = clone_dir.join(kind);
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push_stems_from = |dir: &Path| {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let p = e.path();
+                p.is_file() && p.extension().and_then(|e| e.to_str()) == Some(ext)
+            })
+            .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        for n in names {
+            if seen.insert(n.clone()) {
+                out.push(n);
+            }
+        }
+    };
+    if layers.default {
+        push_stems_from(&base.join("default"));
+    }
+    if layers.languages {
+        for lang in languages {
+            push_stems_from(&base.join(lang));
+        }
+    }
+    if layers.root {
+        push_stems_from(&base);
+    }
+    out
+}
+
+/// Enforce typo-safety on **fresh** contributor flags — entries in `merged.<kind>`
+/// / `merged.drop_<kind>` that weren't already in `previous`. Historical entries
+/// carried through from the lockfile are not re-validated (they rely on the
+/// assembler's move-fallback path and, failing that, the pre-flight name-stale
+/// pass).
+///
+/// For fresh positive adds: must resolve via `resolve_contributor` in the
+/// current template.  For fresh drops: must match some known stem in the
+/// current template layers, the snapshot, or the prior `original_command`.
+pub fn validate_fresh_additions(
+    previous: &OriginalCommand,
+    merged: &OriginalCommand,
+    resolved_languages: &[String],
+    snapshot: Option<&Resolved>,
+    clone_dir: &Path,
+) -> Result<()> {
+    fn fresh<'a>(a: &'a [String], b: &[String]) -> Vec<&'a str> {
+        a.iter().filter(|s| !b.contains(s)).map(String::as_str).collect()
+    }
+
+    let snap_mcp: &[String] = snapshot.map(|r| r.mcp.as_slice()).unwrap_or(&[]);
+    let snap_hooks: &[String] = snapshot.map(|r| r.hooks.as_slice()).unwrap_or(&[]);
+
+    // Fresh positive adds must resolve at the default or root layer — see
+    // `FRESH_POSITIVE_LAYERS` for the rationale. Language-only contributors
+    // stay rejected so `--<kind> foo` can't silently pin a language-scoped
+    // stem as sticky.
+    let check_positive = |label: &str,
+                          kind: &str,
+                          ext: &str,
+                          stems: &[&str]|
+     -> Result<()> {
+        for stem in stems {
+            if resolve_contributor(
+                kind,
+                ext,
+                &FRESH_POSITIVE_LAYERS,
+                stem,
+                resolved_languages,
+                clone_dir,
+            )
+            .is_none()
+            {
+                let available = available_contributor_stems(
+                    kind,
+                    ext,
+                    &FRESH_POSITIVE_LAYERS,
+                    resolved_languages,
+                    clone_dir,
+                );
+                bail!(
+                    "{label} '{stem}' not found at {kind}/{stem}.{ext} or {kind}/default/{stem}.{ext}. \
+                     Language-layer contributors can't be pinned via --{kind} — \
+                     re-file the source at the root or default layer instead. Available: {available:?}"
+                );
+            }
+        }
+        Ok(())
+    };
+
+    let check_drop = |label: &str,
+                      kind: &str,
+                      ext: &str,
+                      layers: &LayerSpec,
+                      stems: &[&str],
+                      snap: &[String],
+                      prior: &[String]|
+     -> Result<()> {
+        for stem in stems {
+            let in_template =
+                resolve_contributor(kind, ext, layers, stem, resolved_languages, clone_dir)
+                    .is_some();
+            let in_snap = snap.iter().any(|s| s == stem);
+            let in_prior = prior.iter().any(|s| s == stem);
+            if !(in_template || in_snap || in_prior) {
+                let mut available =
+                    available_contributor_stems(kind, ext, layers, resolved_languages, clone_dir);
+                for s in snap.iter().chain(prior.iter()) {
+                    if !available.contains(s) {
+                        available.push(s.clone());
+                    }
+                }
+                bail!(
+                    "--drop-{} '{}' does not match any known {} contributor. Known: {:?}",
+                    label,
+                    stem,
+                    kind,
+                    available
+                );
+            }
+        }
+        Ok(())
+    };
+
+    let fresh_mcp = fresh(&merged.mcp, &previous.mcp);
+    let fresh_hooks = fresh(&merged.hooks, &previous.hooks);
+    let fresh_drop_mcp = fresh(&merged.drop_mcp, &previous.drop_mcp);
+    let fresh_drop_hooks = fresh(&merged.drop_hooks, &previous.drop_hooks);
+
+    check_positive("MCP", "mcp", "json", &fresh_mcp)?;
+    check_positive("Hook", "hooks", "json", &fresh_hooks)?;
+    check_drop(
+        "mcp",
+        "mcp",
+        "json",
+        &MCP_LAYERS,
+        &fresh_drop_mcp,
+        snap_mcp,
+        &previous.mcp,
+    )?;
+    check_drop(
+        "hooks",
+        "hooks",
+        "json",
+        &HOOKS_LAYERS,
+        &fresh_drop_hooks,
+        snap_hooks,
+        &previous.hooks,
+    )?;
+    Ok(())
+}
+
+// ── MCP assembly ─────────────────────────────────────────────────────────
+
+/// Result of assembling an aggregation output (`.mcp.json` or
+/// `.claude/settings.local.json`'s hooks block) from layered contributors.
+#[derive(Debug, Clone)]
+pub struct AssemblyResult {
+    /// The merged JSON value (the caller decides where to write it).
+    pub rendered: Value,
+    /// Top-level keys in `rendered` — for MCP this is the server names that
+    /// feed `enabledMcpjsonServers` and the `mcp` jinja dict.
+    pub rendered_keys: Vec<String>,
+    /// Stems eligible for persistence into `lockfile.resolved.<kind>`.
+    /// Excludes language-layer contributions (they re-resolve from
+    /// `original_command.languages` every render) so dropping a language
+    /// implicitly drops its contributors without going through the stale
+    /// prompt. Default-layer and explicit-layer stems are included.
+    pub snapshottable_stems: Vec<String>,
+}
+
+/// Merge the JSON body of a single contributor file into a running accumulator.
+fn merge_json_file_into(path: &Path, dest: &mut Map<String, Value>) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let obj: Map<String, Value> = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    dest.extend(obj);
+    Ok(())
+}
+
+/// Stems of `<ext>` files directly in `dir`, sorted lexicographically, filtered
+/// through `exclude`.
+fn layer_stems(dir: &Path, ext: &str, exclude: &HashSet<String>) -> Result<Vec<String>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let p = e.path();
+            p.is_file() && p.extension().and_then(|e| e.to_str()) == Some(ext)
+        })
+        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .filter(|s| !exclude.contains(s))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Assemble `.mcp.json` from `mcp/default/`, `mcp/<lang>/`, and the explicit
+/// (`user_named` ∪ `sticky_stems`) layer, filtering every layer through
+/// `excluded_stems`. Returns the merged JSON, its top-level keys (server names
+/// for `enabledMcpjsonServers`), and the stems eligible for persistence into
+/// `lockfile.resolved.mcp`.
 pub fn assemble_mcp_json(
     languages: &[String],
-    named_mcps: &[String],
+    user_named: &[String],
+    sticky_stems: &[String],
+    excluded_stems: &HashSet<String>,
     clone_dir: &Path,
-) -> Result<(Value, Vec<String>)> {
+) -> Result<AssemblyResult> {
     let mcp_dir = clone_dir.join("mcp");
 
     if !mcp_dir.exists() {
-        if !named_mcps.is_empty() {
+        if !user_named.is_empty() || !sticky_stems.is_empty() {
             bail!("--mcp specified but no mcp/ directory in template");
         }
-        return Ok((serde_json::json!({"mcpServers": {}}), vec![]));
+        return Ok(AssemblyResult {
+            rendered: serde_json::json!({"mcpServers": {}}),
+            rendered_keys: Vec::new(),
+            snapshottable_stems: Vec::new(),
+        });
     }
 
-    let mut servers = Map::new();
-
-    // 1. Default MCPs (always)
-    servers.extend(read_json_dir(&mcp_dir.join("default"))?);
-
-    // 2. Language-matched MCPs
-    for lang in languages {
-        servers.extend(read_json_dir(&mcp_dir.join(lang))?);
-    }
-
-    // 3. Named MCPs from --mcp flag
-    for name in named_mcps {
-        let path = mcp_dir.join(format!("{}.json", name));
-        if !path.exists() {
-            let available: Vec<_> = fs::read_dir(&mcp_dir)?
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let p = e.path();
-                    p.is_file() && p.extension().map_or(false, |ext| ext == "json")
-                })
-                .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
-                .collect();
-            bail!(
-                "MCP '{}' not found in {}. Available: {:?}",
-                name,
-                mcp_dir.display(),
-                available
-            );
+    let mut servers: Map<String, Value> = Map::new();
+    let mut snapshottable: Vec<String> = Vec::new();
+    let mut snapshot_seen: HashSet<String> = HashSet::new();
+    let push_snap = |stem: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if seen.insert(stem.to_string()) {
+            out.push(stem.to_string());
         }
-        let content = fs::read_to_string(&path)?;
-        let obj: Map<String, Value> = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-        servers.extend(obj);
+    };
+
+    // Layer 1: default/
+    let default_dir = mcp_dir.join("default");
+    let mut default_stems_present: HashSet<String> = HashSet::new();
+    for stem in layer_stems(&default_dir, "json", excluded_stems)? {
+        merge_json_file_into(&default_dir.join(format!("{stem}.json")), &mut servers)?;
+        default_stems_present.insert(stem.clone());
+        push_snap(&stem, &mut snapshottable, &mut snapshot_seen);
     }
 
-    let names: Vec<String> = servers.keys().cloned().collect();
-    let mcp_json = serde_json::json!({ "mcpServers": servers });
+    // Layer 2: per-language
+    let mut lang_stems_present: HashSet<String> = HashSet::new();
+    for lang in languages {
+        let lang_dir = mcp_dir.join(lang);
+        for stem in layer_stems(&lang_dir, "json", excluded_stems)? {
+            merge_json_file_into(&lang_dir.join(format!("{stem}.json")), &mut servers)?;
+            lang_stems_present.insert(stem);
+            // Intentionally NOT pushed into snapshottable — language stems stay
+            // dynamic so dropping a language transitively drops them.
+        }
+    }
 
-    Ok((mcp_json, names))
+    // Layer 3: explicit/sticky (user_named ∪ sticky_stems) − excluded
+    let mut explicit: Vec<String> = Vec::new();
+    let mut explicit_seen: HashSet<String> = HashSet::new();
+    for stem in user_named.iter().chain(sticky_stems.iter()) {
+        if excluded_stems.contains(stem) {
+            continue;
+        }
+        if explicit_seen.insert(stem.clone()) {
+            explicit.push(stem.clone());
+        }
+    }
+    let user_named_set: HashSet<&str> = user_named.iter().map(|s| s.as_str()).collect();
+    for stem in &explicit {
+        let is_user_named = user_named_set.contains(stem.as_str());
+        let root_path = mcp_dir.join(format!("{stem}.json"));
+
+        if is_user_named && root_path.is_file() {
+            // Root-override path: user-typed --mcp whose root file exists.
+            // Merge unconditionally (may overwrite default/lang keys).
+            merge_json_file_into(&root_path, &mut servers)?;
+            push_snap(stem, &mut snapshottable, &mut snapshot_seen);
+        } else if default_stems_present.contains(stem) || lang_stems_present.contains(stem) {
+            // Already-satisfied: contributor was merged by layer 1 or 2.
+            // Skip the re-read. Record in snapshottable if user explicitly
+            // opted in (keeps explicit opt-ins sticky even when they move
+            // to default later).
+            if is_user_named {
+                push_snap(stem, &mut snapshottable, &mut snapshot_seen);
+            }
+        } else {
+            // Move-fallback: stem isn't in layers 1–2 and has no root file
+            // directly. Search the full layer spec so historical opt-ins
+            // whose contributor was relocated upstream still resolve.
+            match resolve_contributor("mcp", "json", &MCP_LAYERS, stem, languages, clone_dir) {
+                Some(path) => {
+                    merge_json_file_into(&path, &mut servers)?;
+                    push_snap(stem, &mut snapshottable, &mut snapshot_seen);
+                }
+                None => {
+                    let available = available_contributor_stems(
+                        "mcp",
+                        "json",
+                        &MCP_LAYERS,
+                        languages,
+                        clone_dir,
+                    );
+                    bail!(
+                        "MCP '{}' not found in {}. Available: {:?}",
+                        stem,
+                        mcp_dir.display(),
+                        available
+                    );
+                }
+            }
+        }
+    }
+
+    let rendered_keys: Vec<String> = servers.keys().cloned().collect();
+    let rendered = serde_json::json!({ "mcpServers": servers });
+
+    Ok(AssemblyResult {
+        rendered,
+        rendered_keys,
+        snapshottable_stems: snapshottable,
+    })
 }
 
 // ── Clarg integration ────────────────────────────────────────────────
@@ -615,15 +1011,102 @@ fn merge_hook_file(path: &Path, dest: &mut Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-/// Build .claude/settings.local.json from base settings + hooks + clarg + MCP list.
+/// Assemble the `hooks` block that feeds `.claude/settings.local.json`. Shape
+/// parallels `assemble_mcp_json` but with `HOOKS_LAYERS` (no language dirs in
+/// today's template). Arrays inside hook-type buckets are concatenated across
+/// contributor files; `rendered_keys` is the merged map's top-level hook-type
+/// names (not contributor stems).
+pub fn assemble_hooks_json(
+    user_named: &[String],
+    sticky_stems: &[String],
+    excluded_stems: &HashSet<String>,
+    clone_dir: &Path,
+) -> Result<AssemblyResult> {
+    let hooks_dir = clone_dir.join("hooks");
+    let mut merged: Map<String, Value> = Map::new();
+    let mut snapshottable: Vec<String> = Vec::new();
+    let mut snapshot_seen: HashSet<String> = HashSet::new();
+
+    // Layer 1: default/
+    let default_dir = hooks_dir.join("default");
+    let mut default_stems_present: HashSet<String> = HashSet::new();
+    for stem in layer_stems(&default_dir, "json", excluded_stems)? {
+        merge_hook_file(&default_dir.join(format!("{stem}.json")), &mut merged)?;
+        default_stems_present.insert(stem.clone());
+        if snapshot_seen.insert(stem.clone()) {
+            snapshottable.push(stem);
+        }
+    }
+
+    // Layer 2: languages — disabled for hooks per HOOKS_LAYERS. Intentionally
+    // omitted to avoid silently picking up `hooks/<lang>/` dirs that no
+    // template uses today.
+
+    // Layer 3: explicit/sticky
+    let mut explicit: Vec<String> = Vec::new();
+    let mut explicit_seen: HashSet<String> = HashSet::new();
+    for stem in user_named.iter().chain(sticky_stems.iter()) {
+        if excluded_stems.contains(stem) {
+            continue;
+        }
+        if explicit_seen.insert(stem.clone()) {
+            explicit.push(stem.clone());
+        }
+    }
+    let user_named_set: HashSet<&str> = user_named.iter().map(|s| s.as_str()).collect();
+    for stem in &explicit {
+        let is_user_named = user_named_set.contains(stem.as_str());
+        let root_path = hooks_dir.join(format!("{stem}.json"));
+
+        if is_user_named && root_path.is_file() {
+            merge_hook_file(&root_path, &mut merged)?;
+            if snapshot_seen.insert(stem.clone()) {
+                snapshottable.push(stem.clone());
+            }
+        } else if default_stems_present.contains(stem) {
+            if is_user_named && snapshot_seen.insert(stem.clone()) {
+                snapshottable.push(stem.clone());
+            }
+        } else {
+            match resolve_contributor("hooks", "json", &HOOKS_LAYERS, stem, &[], clone_dir) {
+                Some(path) => {
+                    merge_hook_file(&path, &mut merged)?;
+                    if snapshot_seen.insert(stem.clone()) {
+                        snapshottable.push(stem.clone());
+                    }
+                }
+                None => {
+                    let available =
+                        available_contributor_stems("hooks", "json", &HOOKS_LAYERS, &[], clone_dir);
+                    bail!(
+                        "Hook '{}' not found in {}. Available: {:?}",
+                        stem,
+                        hooks_dir.display(),
+                        available
+                    );
+                }
+            }
+        }
+    }
+
+    let rendered_keys: Vec<String> = merged.keys().cloned().collect();
+    Ok(AssemblyResult {
+        rendered: Value::Object(merged),
+        rendered_keys,
+        snapshottable_stems: snapshottable,
+    })
+}
+
+/// Build `.claude/settings.local.json` from the pre-assembled hooks block,
+/// clarg PreToolUse entries, and the MCP `rendered_keys` list that populates
+/// `enabledMcpjsonServers`.
 pub fn build_settings(
-    named_hooks: &[String],
+    hooks_result: &AssemblyResult,
     clarg_entries: &[Value],
     active_mcp_names: &[String],
     clone_dir: &Path,
 ) -> Result<()> {
     let base_path = clone_dir.join("settings.local.json");
-    let hooks_dir = clone_dir.join("hooks");
 
     let mut settings: Value = if base_path.exists() {
         let content = fs::read_to_string(&base_path)?;
@@ -636,49 +1119,13 @@ pub fn build_settings(
         .as_object_mut()
         .context("settings.local.json is not an object")?;
 
-    // Merge hooks: default/ always + named hooks
-    let mut merged_hooks: Map<String, Value> = Map::new();
+    let mut merged_hooks: Map<String, Value> = hooks_result
+        .rendered
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
 
-    let default_hooks_dir = hooks_dir.join("default");
-    if default_hooks_dir.is_dir() {
-        let mut entries: Vec<_> = fs::read_dir(&default_hooks_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map_or(false, |ext| ext == "json")
-            })
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            merge_hook_file(&entry.path(), &mut merged_hooks)?;
-        }
-    }
-
-    for name in named_hooks {
-        let path = hooks_dir.join(format!("{}.json", name));
-        if !path.exists() {
-            let available: Vec<_> = fs::read_dir(&hooks_dir)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let p = e.path();
-                    p.is_file() && p.extension().map_or(false, |ext| ext == "json")
-                })
-                .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
-                .collect();
-            bail!(
-                "Hook '{}' not found in {}. Available: {:?}",
-                name,
-                hooks_dir.display(),
-                available
-            );
-        }
-        merge_hook_file(&path, &mut merged_hooks)?;
-    }
-
-    // Merge clarg PreToolUse hook entries
+    // Merge clarg PreToolUse hook entries on top of the assembled hooks.
     for entry in clarg_entries {
         merged_hooks
             .entry("PreToolUse".to_string())
@@ -690,14 +1137,12 @@ pub fn build_settings(
 
     settings_obj.insert("hooks".to_string(), Value::Object(merged_hooks));
 
-    // Update enabledMcpjsonServers
     let mcp_names: Vec<Value> = active_mcp_names
         .iter()
         .map(|n| Value::String(n.clone()))
         .collect();
     settings_obj.insert("enabledMcpjsonServers".to_string(), Value::Array(mcp_names));
 
-    // Write to .claude/settings.local.json
     let claude_dir = clone_dir.join(".claude");
     fs::create_dir_all(&claude_dir)?;
     fs::write(
@@ -1291,9 +1736,28 @@ pub fn list_available(category: &str, clone_dir: &Path) -> Result<String> {
 
 // ── Orchestration ────────────────────────────────────────────────────────
 
+/// Inputs to the render pipeline. `setup` carries the user's latest-merged
+/// command (positive flags + drops). `sticky_mcp` / `sticky_hooks` carry
+/// contributor stems pulled from `lockfile.resolved` that survived the
+/// pre-render name-stale pass (empty for initial setup).
+pub struct RenderInputs<'a> {
+    pub setup: &'a SetupArgs,
+    pub sticky_mcp: &'a [String],
+    pub sticky_hooks: &'a [String],
+}
+
+/// What `run_setup` produces in addition to writing files, for the caller to
+/// persist into the new lockfile.
+#[derive(Debug, Clone)]
+pub struct SetupOutcome {
+    pub resolved_languages: Vec<String>,
+    pub mcp_snapshottable_stems: Vec<String>,
+    pub hooks_snapshottable_stems: Vec<String>,
+}
+
 /// Drive the full clemp pipeline: clone-dir prep → conflict check → write to
-/// `dest_dir`. Returns the resolved language list (useful to callers who want to
-/// compute the resulting manifest).
+/// `dest_dir`. Returns a `SetupOutcome` carrying the resolved language list
+/// and the contributor stems eligible for `lockfile.resolved`.
 ///
 /// * `check_conflicts` — when `true`, aborts (or prompts with `--force`) if
 ///   existing files in `dest_dir` would be overwritten. Set `false` for the
@@ -1302,26 +1766,37 @@ pub fn list_available(category: &str, clone_dir: &Path) -> Result<String> {
 ///   `dest_dir/.git/hooks`. Callers that target a real CWD should gate this on
 ///   the presence of a `.git/` directory themselves.
 pub fn run_setup(
-    args: &SetupArgs,
+    inputs: &RenderInputs,
     clone_dir: &Path,
     dest_dir: &Path,
     check_conflicts: bool,
     install_git_hooks: bool,
-) -> Result<Vec<String>> {
+) -> Result<SetupOutcome> {
+    let args = inputs.setup;
+
     // ── Phase 1: clone_dir prep (no dest_dir mutations) ─────────────────
 
     println!("Resolving languages...");
     let resolved_languages = resolve_all_languages(&args.languages, clone_dir)?;
 
+    let mcp_excluded: HashSet<String> = args.drop_mcp.iter().cloned().collect();
+    let hooks_excluded: HashSet<String> = args.drop_hooks.iter().cloned().collect();
+
     println!("Assembling MCP servers...");
-    let (mcp_json, active_mcps) = assemble_mcp_json(&resolved_languages, &args.mcp, clone_dir)?;
+    let mcp_result = assemble_mcp_json(
+        &resolved_languages,
+        &args.mcp,
+        inputs.sticky_mcp,
+        &mcp_excluded,
+        clone_dir,
+    )?;
     fs::write(
         clone_dir.join(".mcp.json"),
-        serde_json::to_string_pretty(&mcp_json)?,
+        serde_json::to_string_pretty(&mcp_result.rendered)?,
     )?;
 
     println!("Rendering CLAUDE.md...");
-    let claude_md = render_claude_md(&resolved_languages, &active_mcps, clone_dir)?;
+    let claude_md = render_claude_md(&resolved_languages, &mcp_result.rendered_keys, clone_dir)?;
     fs::write(clone_dir.join("CLAUDE.md"), claude_md)?;
 
     let clarg_name = args.clarg.clone().or_else(|| {
@@ -1334,8 +1809,16 @@ pub fn run_setup(
         vec![]
     };
 
+    println!("Assembling hooks...");
+    let hooks_result = assemble_hooks_json(
+        &args.hooks,
+        inputs.sticky_hooks,
+        &hooks_excluded,
+        clone_dir,
+    )?;
+
     println!("Building settings...");
-    build_settings(&args.hooks, &clarg_entries, &active_mcps, clone_dir)?;
+    build_settings(&hooks_result, &clarg_entries, &mcp_result.rendered_keys, clone_dir)?;
 
     if clarg_name.is_some() {
         check_clarg_installed();
@@ -1430,7 +1913,11 @@ pub fn run_setup(
         eprintln!("Warning: git hooks not installed (no .git/ directory in target)");
     }
 
-    Ok(resolved_languages)
+    Ok(SetupOutcome {
+        resolved_languages,
+        mcp_snapshottable_stems: mcp_result.snapshottable_stems,
+        hooks_snapshottable_stems: hooks_result.snapshottable_stems,
+    })
 }
 
 /// Enumerate every file clemp wrote under `dest_dir` (derived from `clone_dir`'s
@@ -1550,6 +2037,8 @@ pub fn normalize_setup_args(args: &mut SetupArgs) {
     args.mcp = split_multi_values(std::mem::take(&mut args.mcp));
     args.commands = split_multi_values(std::mem::take(&mut args.commands));
     args.githooks = split_multi_values(std::mem::take(&mut args.githooks));
+    args.drop_mcp = split_multi_values(std::mem::take(&mut args.drop_mcp));
+    args.drop_hooks = split_multi_values(std::mem::take(&mut args.drop_hooks));
 }
 
 // ── Update flow ──────────────────────────────────────────────────────────
@@ -1701,19 +2190,119 @@ pub fn run_update(
         "No {LOCKFILE_NAME} found in current directory.\nThis doesn't look like a clemp-configured project — run `clemp <args>` to set one up first."
     ))?;
 
-    let merged_command = {
+    let mut merged_command = {
         let mut m = lockfile.original_command.clone();
-        m.merge_additive(&OriginalCommand::from_setup(&args.setup));
+        m.merge_additive(&OriginalCommand::from_setup(&args.setup))?;
         m
     };
 
     let sha_unchanged = template_sha == lockfile.template_sha;
     let command_unchanged = merged_command == lockfile.original_command;
+    // Pre-snapshot lockfiles must do a full re-render even when nothing has
+    // otherwise changed, so `resolved` can be captured. Pins reproducibility
+    // for aggregation-output contributors (see PLAN_snapshot.md).
+    let snapshot_missing = lockfile.resolved.is_none();
     // `--restore-deleted` must inspect the working tree even when nothing in the
     // template has changed, so it cannot share the unchanged-template fast path.
-    if sha_unchanged && command_unchanged && !args.restore_deleted {
+    if sha_unchanged && command_unchanged && !args.restore_deleted && !snapshot_missing {
         println!("Already up to date.");
         return Ok(());
+    }
+
+    // Resolve languages once up front — drives fresh-addition validation, the
+    // name-stale pass, and `resolve_contributor` layer walks.
+    let resolved_languages = resolve_all_languages(&merged_command.languages, clone_dir)?;
+
+    validate_fresh_additions(
+        &lockfile.original_command,
+        &merged_command,
+        &resolved_languages,
+        lockfile.resolved.as_ref(),
+        clone_dir,
+    )?;
+
+    // Name-level stale pass: stems from the lockfile snapshot plus historical
+    // opt-ins from original_command.<kind>, minus anything the merged command
+    // drops, probed against the current template. Stems with no current
+    // contributor become `stale_<kind>`; survivors become `sticky_<kind>` fed
+    // into assembly.
+    let drop_mcp_set: HashSet<String> = merged_command.drop_mcp.iter().cloned().collect();
+    let drop_hooks_set: HashSet<String> = merged_command.drop_hooks.iter().cloned().collect();
+
+    let candidate_mcp: Vec<String> = {
+        let snap = lockfile.resolved.as_ref().map(|r| r.mcp.as_slice()).unwrap_or(&[]);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        for s in snap.iter().chain(merged_command.mcp.iter()) {
+            if drop_mcp_set.contains(s) { continue; }
+            if seen.insert(s.clone()) { out.push(s.clone()); }
+        }
+        out
+    };
+    let candidate_hooks: Vec<String> = {
+        let snap = lockfile.resolved.as_ref().map(|r| r.hooks.as_slice()).unwrap_or(&[]);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        for s in snap.iter().chain(merged_command.hooks.iter()) {
+            if drop_hooks_set.contains(s) { continue; }
+            if seen.insert(s.clone()) { out.push(s.clone()); }
+        }
+        out
+    };
+
+    let (sticky_mcp, stale_mcp): (Vec<String>, Vec<String>) = candidate_mcp
+        .into_iter()
+        .partition(|s| {
+            resolve_contributor("mcp", "json", &MCP_LAYERS, s, &resolved_languages, clone_dir)
+                .is_some()
+        });
+    let (sticky_hooks, stale_hooks): (Vec<String>, Vec<String>) = candidate_hooks
+        .into_iter()
+        .partition(|s| {
+            resolve_contributor("hooks", "json", &HOOKS_LAYERS, s, &[], clone_dir).is_some()
+        });
+
+    // Single confirm-or-bail UX for name-stale contributors. Declining bails
+    // with zero side effects so the user can re-run with `--drop-<kind>` or
+    // restore the contributor upstream.
+    for (kind, stale, output) in [
+        ("MCP", &stale_mcp, ".mcp.json"),
+        ("hook", &stale_hooks, ".claude/settings.local.json"),
+    ] {
+        if stale.is_empty() {
+            continue;
+        }
+        if args.prune_stale {
+            println!(
+                "Dropping {} stale {} contributors: {}",
+                stale.len(),
+                kind,
+                stale.join(", ")
+            );
+        } else {
+            println!(
+                "The template no longer provides these {} contributors: {}",
+                kind,
+                stale.join(", ")
+            );
+            if !confirm(&format!("They will be removed from {output}. Continue?"))? {
+                bail!("Aborted. Re-run with --prune-stale, or --drop-{kind} the stems explicitly, or restore them upstream.",
+                    kind = if kind == "MCP" { "mcp" } else { "hooks" });
+            }
+        }
+    }
+
+    // Strip accepted/pruned stale stems from the persisted command so
+    // `setup_args.mcp`/`hooks` (derived from merged_command below) no longer
+    // carries them into the assembler's user_named path — where they would
+    // bail with "MCP/Hook not found" after their contributor disappeared
+    // upstream. The stems are already gone from sticky_mcp/hooks above; this
+    // closes the symmetric hole in the explicit/historical list.
+    if !stale_mcp.is_empty() {
+        merged_command.mcp.retain(|s| !stale_mcp.contains(s));
+    }
+    if !stale_hooks.is_empty() {
+        merged_command.hooks.retain(|s| !stale_hooks.contains(s));
     }
 
     // Render the new template into a temp staging directory.
@@ -1729,7 +2318,14 @@ pub fn run_update(
         s
     };
 
-    let resolved = run_setup(&setup_args, clone_dir, &staging, false, true)?;
+    let render_inputs = RenderInputs {
+        setup: &setup_args,
+        sticky_mcp: &sticky_mcp,
+        sticky_hooks: &sticky_hooks,
+    };
+
+    let outcome = run_setup(&render_inputs, clone_dir, &staging, false, true)?;
+    let resolved = outcome.resolved_languages;
     let new_manifest = compute_manifest(&setup_args, &resolved, clone_dir, &staging)?;
 
     // Classify every file in the new render.
@@ -1911,6 +2507,10 @@ pub fn run_update(
         template_repo: template_repo.to_string(),
         template_sha: template_sha.to_string(),
         original_command: merged_command,
+        resolved: Some(Resolved {
+            mcp: outcome.mcp_snapshottable_stems,
+            hooks: outcome.hooks_snapshottable_stems,
+        }),
         files: new_manifest,
     };
     new_lockfile.save(cwd)?;

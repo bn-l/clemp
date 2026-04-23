@@ -2,12 +2,20 @@
 
 mod common;
 
-use clemp::{build_settings, run_setup, setup_clarg, SetupArgs, CLONE_DIR};
-use std::path::Path;
+use clemp::{
+    assemble_hooks_json, build_settings, run_setup, setup_clarg, RenderInputs, SetupArgs,
+    CLONE_DIR,
+};
 use common::{CwdGuard, Scaffold};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 use tempfile::TempDir;
+
+fn empty() -> HashSet<String> {
+    HashSet::new()
+}
 
 #[test]
 fn setup_clarg_copies_yaml_and_returns_hook_entry() {
@@ -63,7 +71,8 @@ fn clarg_entry_merged_into_pretooluse_hooks() {
     )]);
 
     let entry = setup_clarg("strict", s.path()).unwrap();
-    build_settings(&[], &[entry], &[], s.path()).unwrap();
+    let hooks = assemble_hooks_json(&[], &[], &empty(), s.path()).unwrap();
+    build_settings(&hooks, &[entry], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
@@ -85,7 +94,8 @@ fn clarg_merges_with_existing_pretooluse_hooks() {
     s.with_clarg_configs(&[("strict", "internal_access_only: true")]);
 
     let entry = setup_clarg("strict", s.path()).unwrap();
-    build_settings(&[], &[entry], &[], s.path()).unwrap();
+    let hooks = assemble_hooks_json(&[], &[], &empty(), s.path()).unwrap();
+    build_settings(&hooks, &[entry], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
@@ -104,7 +114,8 @@ fn clarg_without_clarg_entry_leaves_hooks_unchanged() {
     s.with_default_hooks(&[("sound", r#"{"Notification": [{"command": "beep"}]}"#)]);
 
     // No clarg entries
-    build_settings(&[], &[], &[], s.path()).unwrap();
+    let hooks = assemble_hooks_json(&[], &[], &empty(), s.path()).unwrap();
+    build_settings(&hooks, &[], &[], s.path()).unwrap();
 
     let content = fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap();
     let val: Value = serde_json::from_str(&content).unwrap();
@@ -149,11 +160,20 @@ fn default_yaml_applied_without_clarg_flag() {
         mcp: vec![],
         commands: vec![],
         githooks: vec![],
+        drop_mcp: vec![],
+        drop_hooks: vec![],
         clarg: None,
         force: false,
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(
+        &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
 
     // clarg-default.yaml copied
     assert!(s.path().join(".claude/clarg-default.yaml").exists());
@@ -190,11 +210,20 @@ fn explicit_clarg_flag_overrides_default() {
         mcp: vec![],
         commands: vec![],
         githooks: vec![],
+        drop_mcp: vec![],
+        drop_hooks: vec![],
         clarg: Some("strict".into()),
         force: false,
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(
+        &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
 
     // Only strict copied, not default
     assert!(s.path().join(".claude/clarg-strict.yaml").exists());
@@ -227,11 +256,20 @@ fn no_default_yaml_and_no_flag_skips_clarg() {
         mcp: vec![],
         commands: vec![],
         githooks: vec![],
+        drop_mcp: vec![],
+        drop_hooks: vec![],
         clarg: None,
         force: false,
     };
 
-    run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
+    run_setup(
+        &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
 
     let settings: Value = serde_json::from_str(
         &fs::read_to_string(s.path().join(".claude/settings.local.json")).unwrap(),

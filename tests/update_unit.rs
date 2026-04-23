@@ -7,8 +7,8 @@ mod common;
 use clap::Parser;
 use clemp::{
     classify_update_path, compute_manifest, hash_bytes, lockfile_key, merge_with_claude,
-    normalize_setup_args, run_setup, Cli, CliCommand, Lockfile, OriginalCommand, SetupArgs,
-    UpdateClass,
+    normalize_setup_args, reject_add_drop_overlap, run_setup, Cli, CliCommand, Lockfile,
+    OriginalCommand, RenderInputs, SetupArgs, UpdateClass,
 };
 use common::{CwdGuard, PathGuard, Scaffold};
 use std::collections::BTreeMap;
@@ -26,6 +26,8 @@ fn merge_additive_unions_vectors_without_duplicates() {
         mcp: vec!["context7".into()],
         commands: vec!["review".into()],
         githooks: vec!["pre-push".into()],
+        drop_mcp: vec![],
+        drop_hooks: vec![],
         clarg: Some("default".into()),
     };
     let b = OriginalCommand {
@@ -34,9 +36,11 @@ fn merge_additive_unions_vectors_without_duplicates() {
         mcp: vec![],
         commands: vec!["review".into(), "deploy".into()],
         githooks: vec!["commit-msg".into()],
+        drop_mcp: vec![],
+        drop_hooks: vec![],
         clarg: None,
     };
-    a.merge_additive(&b);
+    a.merge_additive(&b).unwrap();
 
     assert_eq!(a.languages, vec!["typescript", "python"]);
     assert_eq!(a.hooks, vec!["sound", "lint"]);
@@ -57,7 +61,7 @@ fn merge_additive_replaces_clarg_only_when_other_set() {
         clarg: Some("strict".into()),
         ..Default::default()
     };
-    a.merge_additive(&b);
+    a.merge_additive(&b).unwrap();
     assert_eq!(a.clarg.as_deref(), Some("strict"));
 }
 
@@ -71,7 +75,7 @@ fn merge_additive_clarg_unset_on_other_preserves_existing() {
         clarg: None,
         ..Default::default()
     };
-    a.merge_additive(&b);
+    a.merge_additive(&b).unwrap();
     assert_eq!(a.clarg.as_deref(), Some("default"));
 }
 
@@ -127,7 +131,7 @@ fn merge_additive_dedupes_language_aliases() {
         languages: vec!["typescript".into(), "python".into(), "TS".into()],
         ..Default::default()
     };
-    a.merge_additive(&b);
+    a.merge_additive(&b).unwrap();
     // "typescript" and "TS" both canonicalize to "typescript" (already present
     // via "ts"), so only "python" should be appended.
     assert_eq!(
@@ -145,12 +149,199 @@ fn merge_additive_dedupes_languages_in_other_side_too() {
         languages: vec!["ts".into(), "typescript".into(), "python".into(), "py".into()],
         ..Default::default()
     };
-    a.merge_additive(&b);
+    a.merge_additive(&b).unwrap();
     assert_eq!(
         a.languages,
         vec!["ts", "python"],
         "dedup must also apply within the incoming list"
     );
+}
+
+// ── Drop-flag reconciliation semantics ──────────────────────────────────
+
+#[test]
+fn merge_additive_same_invocation_mcp_add_and_drop_is_rejected() {
+    let mut a = OriginalCommand::default();
+    let b = OriginalCommand {
+        mcp: vec!["context7".into()],
+        drop_mcp: vec!["context7".into()],
+        ..Default::default()
+    };
+    let err = a.merge_additive(&b).unwrap_err().to_string();
+    assert!(
+        err.contains("context7") && err.contains("--mcp") && err.contains("--drop-mcp"),
+        "same-invocation --mcp + --drop-mcp for the same stem must be rejected: {err}"
+    );
+}
+
+#[test]
+fn merge_additive_same_invocation_hooks_add_and_drop_is_rejected() {
+    let mut a = OriginalCommand::default();
+    let b = OriginalCommand {
+        hooks: vec!["sound".into()],
+        drop_hooks: vec!["sound".into()],
+        ..Default::default()
+    };
+    let err = a.merge_additive(&b).unwrap_err().to_string();
+    assert!(
+        err.contains("sound") && err.contains("--hooks") && err.contains("--drop-hooks"),
+        "same-invocation --hooks + --drop-hooks for the same stem must be rejected: {err}"
+    );
+}
+
+#[test]
+fn merge_additive_fresh_add_clears_persisted_drop_mcp() {
+    // Prior lockfile captured `--drop-mcp context7`. A newer invocation types
+    // `--mcp context7` to undrop it — the persisted drop must be cleared
+    // AND the stem must land in mcp.
+    let mut a = OriginalCommand {
+        drop_mcp: vec!["context7".into()],
+        ..Default::default()
+    };
+    let b = OriginalCommand {
+        mcp: vec!["context7".into()],
+        ..Default::default()
+    };
+    a.merge_additive(&b).unwrap();
+    assert_eq!(a.mcp, vec!["context7"]);
+    assert!(
+        a.drop_mcp.is_empty(),
+        "newer --mcp must clear persisted --drop-mcp, got {:?}",
+        a.drop_mcp
+    );
+}
+
+#[test]
+fn merge_additive_fresh_drop_clears_persisted_mcp() {
+    // Reverse direction: persisted --mcp gets undone by a newer --drop-mcp.
+    let mut a = OriginalCommand {
+        mcp: vec!["context7".into()],
+        ..Default::default()
+    };
+    let b = OriginalCommand {
+        drop_mcp: vec!["context7".into()],
+        ..Default::default()
+    };
+    a.merge_additive(&b).unwrap();
+    assert!(
+        a.mcp.is_empty(),
+        "newer --drop-mcp must clear persisted --mcp, got {:?}",
+        a.mcp
+    );
+    assert_eq!(a.drop_mcp, vec!["context7"]);
+}
+
+#[test]
+fn merge_additive_fresh_add_clears_persisted_drop_hooks_symmetric() {
+    // Hooks follow the same reconciliation shape as mcp.
+    let mut a = OriginalCommand {
+        drop_hooks: vec!["sound".into()],
+        ..Default::default()
+    };
+    let b = OriginalCommand {
+        hooks: vec!["sound".into()],
+        ..Default::default()
+    };
+    a.merge_additive(&b).unwrap();
+    assert_eq!(a.hooks, vec!["sound"]);
+    assert!(a.drop_hooks.is_empty());
+
+    // And symmetrically fresh drop clears persisted add.
+    let mut a = OriginalCommand {
+        hooks: vec!["sound".into()],
+        ..Default::default()
+    };
+    let b = OriginalCommand {
+        drop_hooks: vec!["sound".into()],
+        ..Default::default()
+    };
+    a.merge_additive(&b).unwrap();
+    assert!(a.hooks.is_empty());
+    assert_eq!(a.drop_hooks, vec!["sound"]);
+}
+
+// ── CLI parsing for drop flags ──────────────────────────────────────────
+
+#[test]
+fn cli_update_drop_flags_parse_comma_and_whitespace() {
+    let cli = Cli::try_parse_from([
+        "clemp",
+        "update",
+        "--drop-mcp",
+        "context7,puppeteer",
+        "--drop-hooks",
+        "sound",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(CliCommand::Update(args)) => {
+            assert_eq!(args.setup.drop_mcp, vec!["context7", "puppeteer"]);
+            assert_eq!(args.setup.drop_hooks, vec!["sound"]);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+// ── Shared overlap validator (setup + update both use it) ───────────────
+
+#[test]
+fn reject_add_drop_overlap_detects_mcp_overlap_on_fresh_setup_command() {
+    // Initial setup doesn't go through `merge_additive`. The standalone
+    // overlap guard must still reject `--mcp foo --drop-mcp foo` before any
+    // files are touched — otherwise the drop would silently win via the
+    // exclusion set.
+    let cmd = OriginalCommand {
+        mcp: vec!["context7".into()],
+        drop_mcp: vec!["context7".into()],
+        ..Default::default()
+    };
+    let err = reject_add_drop_overlap(&cmd).unwrap_err().to_string();
+    assert!(
+        err.contains("context7") && err.contains("--mcp") && err.contains("--drop-mcp"),
+        "overlap guard must flag context7 conflict for initial setup: {err}"
+    );
+}
+
+#[test]
+fn reject_add_drop_overlap_detects_hooks_overlap() {
+    let cmd = OriginalCommand {
+        hooks: vec!["sound".into()],
+        drop_hooks: vec!["sound".into()],
+        ..Default::default()
+    };
+    let err = reject_add_drop_overlap(&cmd).unwrap_err().to_string();
+    assert!(
+        err.contains("sound") && err.contains("--hooks") && err.contains("--drop-hooks"),
+        "overlap guard must flag hooks conflict: {err}"
+    );
+}
+
+#[test]
+fn reject_add_drop_overlap_allows_disjoint_sets() {
+    let cmd = OriginalCommand {
+        mcp: vec!["context7".into()],
+        drop_mcp: vec!["puppeteer".into()],
+        hooks: vec!["sound".into()],
+        drop_hooks: vec!["lint".into()],
+        ..Default::default()
+    };
+    reject_add_drop_overlap(&cmd).unwrap();
+}
+
+#[test]
+fn cli_setup_drop_flags_on_default_command() {
+    let cli = Cli::try_parse_from([
+        "clemp",
+        "ts",
+        "--drop-mcp",
+        "context7",
+        "--drop-hooks",
+        "sound,lint",
+    ])
+    .unwrap();
+    assert!(cli.command.is_none());
+    assert_eq!(cli.setup.drop_mcp, vec!["context7"]);
+    assert_eq!(cli.setup.drop_hooks, vec!["sound", "lint"]);
 }
 
 // ── CLI parsing: update / list subcommands ──────────────────────────────
@@ -248,8 +439,11 @@ fn lockfile_round_trip_preserves_all_fields() {
             mcp: vec!["context7".into()],
             commands: vec!["review".into()],
             githooks: vec!["pre-push".into()],
+            drop_mcp: vec![],
+            drop_hooks: vec![],
             clarg: Some("default".into()),
         },
+        resolved: None,
         files: files.clone(),
     };
 
@@ -307,8 +501,15 @@ fn compute_manifest_includes_root_files_overlays_excludes_meta() {
         languages: vec!["ts".into()],
         ..Default::default()
     };
-    let resolved = run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
-    let manifest = compute_manifest(&args, &resolved, s.path(), Path::new(".")).unwrap();
+    let outcome = run_setup(
+        &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
+    let manifest = compute_manifest(&args, &outcome.resolved_languages, s.path(), Path::new(".")).unwrap();
 
     assert!(manifest.contains_key("CLAUDE.md"), "manifest must contain CLAUDE.md");
     assert!(manifest.contains_key(".mcp.json"), "manifest must contain .mcp.json");
@@ -348,8 +549,15 @@ fn compute_manifest_no_git_hooks_entries_when_no_git_dir() {
         languages: vec!["ts".into()],
         ..Default::default()
     };
-    let resolved = run_setup(&args, s.path(), Path::new("."), true, false).unwrap();
-    let manifest = compute_manifest(&args, &resolved, s.path(), Path::new(".")).unwrap();
+    let outcome = run_setup(
+        &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        false,
+    )
+    .unwrap();
+    let manifest = compute_manifest(&args, &outcome.resolved_languages, s.path(), Path::new(".")).unwrap();
 
     assert!(
         !manifest.keys().any(|k| k.starts_with(".git/hooks/")),
@@ -373,8 +581,15 @@ fn compute_manifest_includes_git_hooks_when_installed() {
         languages: vec!["ts".into()],
         ..Default::default()
     };
-    let resolved = run_setup(&args, s.path(), Path::new("."), true, true).unwrap();
-    let manifest = compute_manifest(&args, &resolved, s.path(), Path::new(".")).unwrap();
+    let outcome = run_setup(
+        &RenderInputs { setup: &args, sticky_mcp: &[], sticky_hooks: &[] },
+        s.path(),
+        Path::new("."),
+        true,
+        true,
+    )
+    .unwrap();
+    let manifest = compute_manifest(&args, &outcome.resolved_languages, s.path(), Path::new(".")).unwrap();
 
     assert!(
         manifest.contains_key(".git/hooks/pre-commit"),
