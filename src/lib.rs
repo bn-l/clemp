@@ -2369,18 +2369,21 @@ pub fn run_update(
         .collect();
 
     println!("\nUpdate plan:");
-    if !clean.is_empty()    { println!("  {:>3} cleanly updated", clean.len()); }
-    if !new_files.is_empty() { println!("  {:>3} new", new_files.len()); }
-    if !skipped.is_empty()   { println!("  {:>3} preserved (user-modified, template unchanged)", skipped.len()); }
-    if !conflicts.is_empty() { println!("  {:>3} conflicting (user + template both changed)", conflicts.len()); }
-    if !collisions.is_empty(){ println!("  {:>3} collisions (template introduced file, you already have one)", collisions.len()); }
-    if !shape_collisions.is_empty() {
-        println!("  {:>3} shape collisions (directory exists where template wants a file)", shape_collisions.len());
-    }
-    if !stale.is_empty()     { println!("  {:>3} stale (template no longer produces)", stale.len()); }
-    if !restore_pending.is_empty() {
-        println!("  {:>3} missing (use --restore-deleted to re-add)", restore_pending.len());
-    }
+    let report = |paths: &[String], label: &str| {
+        if paths.is_empty() { return; }
+        println!("  {:>3} {}", paths.len(), label);
+        for p in paths {
+            println!("        {p}");
+        }
+    };
+    report(&clean, "cleanly updated");
+    report(&new_files, "new");
+    report(&skipped, "preserved (user-modified, template unchanged)");
+    report(&conflicts, "conflicting (user + template both changed)");
+    report(&collisions, "collisions (template introduced file, you already have one)");
+    report(&shape_collisions, "shape collisions (directory exists where template wants a file)");
+    report(&stale, "stale (template no longer produces)");
+    report(&restore_pending, "missing (use --restore-deleted to re-add)");
 
     // Shape collisions can only be resolved by --force (Claude can't merge into a directory).
     if !shape_collisions.is_empty() && !args.setup.force {
