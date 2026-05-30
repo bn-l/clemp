@@ -3,7 +3,7 @@
 ### Quick Reference
 - **Critical Paths**:
   - **Initial setup** (`main.rs::run_setup_cmd`): clone → `run_setup(args, clone_dir, ".", check_conflicts=true, install_git_hooks=<CWD has .git>)` → `compute_manifest(".")` → write `.clemp-lock.yaml` → cleanup. Errors mid-setup roll back clone_dir and any created `.gitignore`.
-  - **Update** (`main.rs::run_update_cmd` → `lib::run_update`): read `.clemp-lock.yaml` → clone → merge CLI args additively into stored `OriginalCommand` → early-exit if SHA+command unchanged AND `--restore-deleted` is NOT set → `run_setup` into a `env::temp_dir()/clemp-update-<pid>` staging dir → `compute_manifest(staging)` to get new template hashes → classify each path via `classify_update_path` (clean / new / skipped / conflict / collision / shape-collision / stale / missing / identical) → preflight: bail if any `shape_collisions` without `--force`, bail if `claude` missing on PATH and any conflicts/collisions exist without `--force` → Claude merge or `--force` for collisions then conflicts → `--force` apply for shape collisions → stale prune (prompt-or-`--prune-stale`) → apply clean+new writes → rewrite lockfile with new template manifest.
+  - **Update** (`main.rs::run_update_cmd` → `lib::run_update`): read `.clemp-lock.yaml` → clone → merge CLI args additively into stored `OriginalCommand` → early-exit if SHA+command unchanged AND `--restore-deleted` is NOT set → `run_setup` into a `env::temp_dir()/clemp-update-<pid>` staging dir → `compute_manifest(staging)` to get new template hashes → classify each path via `classify_update_path` (clean / new / skipped / conflict / collision / shape-collision / stale / missing / identical) → preflight: bail if any `shape_collisions` without `--force`, bail if `--merge` and `claude` missing on PATH → conflict/collision resolution: default keeps user's version (keep-own), `--merge` routes through Claude, `--force` overwrites with template → `--force` apply for shape collisions → stale prune (prompt-or-`--prune-stale`) → apply clean+new writes → rewrite lockfile with new template manifest.
   - **List** (`main.rs::run_list`): clone → `list_available(category, clone_dir)` → print → remove clone dir. Early-exits, never touches CWD.
 - **Architectural Rules**:
   - `COPY_FILES_EXCLUDE` (module-level constant in `src/lib.rs`) must stay in sync with template structure dirs (`commands`, `skills`, `copied`, `hooks`, `mcp`, `githooks`, `clarg`, `claude-md`, etc.). `compute_manifest` uses the same list to enumerate which dest_dir paths are clemp-owned.
@@ -19,7 +19,7 @@
 - (`src/lib.rs`, shared arg set for `clemp` and `clemp update`, `SetupArgs` — clap `Args`-derived, field-for-field mirror of `OriginalCommand` + `force`)
 - (`src/lib.rs`, top-level CLI, `Cli { command: Option<CliCommand>, setup: SetupArgs, version }`)
 - (`src/lib.rs`, subcommands, `CliCommand::{Update(UpdateArgs), List { category: Option<String> }}`)
-- (`src/lib.rs`, update-only args, `UpdateArgs { setup: SetupArgs, prune_stale: bool, restore_deleted: bool }`)
+- (`src/lib.rs`, update-only args, `UpdateArgs { setup: SetupArgs, prune_stale: bool, restore_deleted: bool, merge: bool }`)
 - (`src/lib.rs`, persisted invocation for update's additive-merge, `OriginalCommand { languages, hooks, mcp, commands, githooks, clarg }`)
 - (`src/lib.rs`, project-root lockfile at `.clemp-lock.yaml`, `Lockfile { template_repo, template_sha, original_command, files: BTreeMap<String, String> }`)
 - (`src/lib.rs`, persistent config at `~/.config/clemp/clemp.yaml`, `Config { gh_repo: Option<String> }`)
@@ -37,7 +37,8 @@
 - `clemp update [LANGUAGE...] [OPTIONS]` — additive update. Same flags as setup, plus:
   - `--prune-stale` — delete files the template no longer produces without prompting
   - `--restore-deleted` — re-copy files the user removed from disk
-  - `--force` — skip interactive Claude merge, overwrite conflicts with template version
+  - `--merge` — use Claude to interactively merge conflicts (default: keep user's version)
+  - `--force` — overwrite conflicts with template version (mutually exclusive with `--merge`)
 - `clemp list [CATEGORY]` — list available template files. `CATEGORY` is one of `mcp`, `hooks`, `commands`, `githooks`, `clarg`, `gitignore`, `languages`; omit for all categories with headers.
 - `-v` / `--version` — top-level, prints version from `Cargo.toml`
 
@@ -102,9 +103,10 @@
 - Classifies each manifest entry via `classify_update_path(old_hash, cur_hash, new_hash, cwd_is_dir) -> UpdateClass`. A directory at a path where the template wants a file becomes `ShapeCollision` regardless of lockfile state.
 - Preflight gates BEFORE any writes:
   - `shape_collisions` non-empty without `--force` → bail (Claude can't merge into a directory)
-  - `conflicts` OR `collisions` non-empty without `--force` AND `claude` missing on PATH → bail
+  - `--merge` requested AND (`conflicts` OR `collisions` non-empty) AND `claude` missing on PATH → bail
   - Any stale path that is a FILE on disk AND whose path is a strict prefix of some new/clean entry (file→directory template transition) AND `--prune-stale` not set → bail. Otherwise declining the later stale prompt would leave clean/new `create_dir_all` failing after merges had already landed.
-- Apply order is: collisions (Claude or `--force`) → conflicts (Claude or `--force`) → shape-collisions (`--force` only) → stale prune (prompt-or-`--prune-stale`) → clean+new writes. Merges (the fail-prone step) run FIRST so a failed `merge_with_claude` leaves the project untouched — stale files still on disk, clean files at their old hashes, lockfile pinned to old SHA. Stale runs AFTER merges (so `--prune-stale` can't delete files that a later aborted merge would have rolled back) but BEFORE clean/new so file→directory template transitions unblock the new directory writes.
+- Conflict/collision resolution: `--force` overwrites with template version, `--merge` routes through Claude merge, default keeps user's version (keep-own). `--merge` and `--force` are mutually exclusive (enforced by clap `conflicts_with`). Keep-own files are not touched on disk but the lockfile records the template hash, so the next update classifies them as Skipped (template unchanged) or Conflict (template changed again).
+- Apply order is: collisions+conflicts (`--force` or `--merge` only, skipped under keep-own) → shape-collisions (`--force` only) → stale prune (prompt-or-`--prune-stale`) → clean+new writes. Under `--merge`, merges (the fail-prone step) run FIRST so a failed `merge_with_claude` leaves the project untouched — stale files still on disk, clean files at their old hashes, lockfile pinned to old SHA. Stale runs AFTER conflict resolution (so `--prune-stale` can't delete files that a later aborted merge would have rolled back) but BEFORE clean/new so file→directory template transitions unblock the new directory writes.
 - `merge_with_claude` returns an error on non-zero `claude` exit; `run_update` propagates it without saving a new lockfile so a failed merge cannot advance the baseline.
 - `apply_one` removes any directory present at the destination path before copying (handles `--force` shape-collision overwrites).
 - Always re-runs `update_gitignore(clone_dir, ".")` at end of apply

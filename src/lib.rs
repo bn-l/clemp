@@ -160,6 +160,10 @@ pub struct UpdateArgs {
     /// Re-copy files that were removed from the working directory
     #[arg(long)]
     pub restore_deleted: bool,
+
+    /// Use Claude to interactively merge conflicts instead of keeping your version
+    #[arg(long, conflicts_with = "force")]
+    pub merge: bool,
 }
 
 // ── Lockfile ─────────────────────────────────────────────────────────────
@@ -2379,8 +2383,16 @@ pub fn run_update(
     report(&clean, "cleanly updated");
     report(&new_files, "new");
     report(&skipped, "preserved (user-modified, template unchanged)");
-    report(&conflicts, "conflicting (user + template both changed)");
-    report(&collisions, "collisions (template introduced file, you already have one)");
+    report(&conflicts, if args.merge {
+        "conflicting — will merge with Claude (user + template both changed)"
+    } else {
+        "kept (user + template both changed, use --merge to reconcile)"
+    });
+    report(&collisions, if args.merge {
+        "collisions — will merge with Claude (template introduced file, you already have one)"
+    } else {
+        "kept (template introduced file, you already have one, use --merge to reconcile)"
+    });
     report(&shape_collisions, "shape collisions (directory exists where template wants a file)");
     report(&stale, "stale (template no longer produces)");
     report(&restore_pending, "missing (use --restore-deleted to re-add)");
@@ -2420,18 +2432,16 @@ pub fn run_update(
         );
     }
 
-    // Conflicts AND collisions both route through Claude. Gate before any writes.
-    let needs_claude = (!conflicts.is_empty() || !collisions.is_empty()) && !args.setup.force;
-    if needs_claude && !claude_available() {
+    // Claude merge only runs with --merge. Gate on claude availability.
+    if args.merge && (!conflicts.is_empty() || !collisions.is_empty()) && !claude_available() {
         let _ = fs::remove_dir_all(&staging);
         let affected: Vec<String> = conflicts.iter().chain(collisions.iter()).cloned().collect();
         bail!(
-            "The following files need an interactive merge (you've changed them and so has the template, \
-             or the template now wants a path you already use):\n  {}\n\n\
-             `claude` CLI not found on PATH — interactive merging isn't possible.\n\
+            "The following files need an interactive merge but `claude` CLI was not found on PATH:\n  {}\n\n\
              Options:\n  \
-             - Install Claude Code and re-run `clemp update`\n  \
-             - Run `clemp update --force` to overwrite your edits with the template version",
+             - Install Claude Code and re-run `clemp update --merge`\n  \
+             - Run `clemp update --force` to overwrite your edits with the template version\n  \
+             - Omit `--merge` to keep your version (default)",
             affected.join("\n  ")
         );
     }
@@ -2444,21 +2454,12 @@ pub fn run_update(
     // - clean files still at their old hashes (so next retry classifies them as
     //   `clean` instead of bogus `conflict` via old != cur == new).
 
-    // Collisions: path is new from template's perspective. Overwrite with --force,
-    // else route through Claude merge (treat like a conflict).
-    for path in &collisions {
+    // Collisions + conflicts: --force overwrites, --merge routes through Claude,
+    // default keeps user's version on disk (lockfile still advances).
+    for path in collisions.iter().chain(conflicts.iter()) {
         if args.setup.force {
             apply_one(path, &staging, cwd)?;
-        } else {
-            merge_with_claude(path, &staging, cwd)?;
-        }
-    }
-
-    // Conflicts: --force overwrites, else Claude merges.
-    for path in &conflicts {
-        if args.setup.force {
-            apply_one(path, &staging, cwd)?;
-        } else {
+        } else if args.merge {
             merge_with_claude(path, &staging, cwd)?;
         }
     }

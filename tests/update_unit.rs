@@ -377,6 +377,24 @@ fn cli_update_restore_deleted_force_flags() {
 }
 
 #[test]
+fn cli_update_merge_flag_parses() {
+    let cli = Cli::try_parse_from(["clemp", "update", "--merge"]).unwrap();
+    match cli.command {
+        Some(CliCommand::Update(args)) => {
+            assert!(args.merge);
+            assert!(!args.setup.force);
+        }
+        _ => panic!("expected Update"),
+    }
+}
+
+#[test]
+fn cli_update_merge_and_force_conflict() {
+    let err = Cli::try_parse_from(["clemp", "update", "--merge", "--force"]);
+    assert!(err.is_err(), "--merge and --force must be mutually exclusive");
+}
+
+#[test]
 fn cli_list_no_category() {
     let cli = Cli::try_parse_from(["clemp", "list"]).unwrap();
     match cli.command {
