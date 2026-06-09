@@ -4,9 +4,10 @@
 use anyhow::Result;
 use clap::Parser;
 use clemp::{
-    cleanup, clone_repo, compute_manifest, get_repo_url, list_available, normalize_setup_args,
-    reject_add_drop_overlap, resolve_all_languages, run_setup, run_update, validate_fresh_additions,
-    Cli, CliCommand, Lockfile, OriginalCommand, RenderInputs, Resolved, CLONE_DIR, LOCKFILE_NAME,
+    checkout_sha, cleanup, clone_repo, compute_manifest, get_repo_url, list_available,
+    normalize_setup_args, reject_add_drop_overlap, resolve_all_languages, run_setup, run_update,
+    validate_fresh_additions, Cli, CliCommand, Lockfile, OriginalCommand, RenderInputs, Resolved,
+    CLONE_DIR, LOCKFILE_NAME,
 };
 use std::fs;
 use std::path::Path;
@@ -122,7 +123,16 @@ fn run_update_cmd(args: clemp::UpdateArgs, clone_dir: &Path) -> Result<()> {
     println!("Cloning {}...", repo_url);
     let template_sha = clone_repo(&repo_url)?;
 
-    let result = run_update(&args, clone_dir, &template_sha, &repo_url);
+    // --only: pin the clone to the lockfile's SHA so only the argument delta
+    // (e.g. a new --mcp) has an effect — no upstream template changes land.
+    let effective_sha = if args.only {
+        checkout_sha(clone_dir, &lock.template_sha)?;
+        lock.template_sha.clone()
+    } else {
+        template_sha
+    };
+
+    let result = run_update(&args, clone_dir, &effective_sha, &repo_url);
 
     let _ = cleanup(clone_dir);
     result

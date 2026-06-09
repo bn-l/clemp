@@ -48,6 +48,7 @@ fn ts_update(force: bool, merge: bool, prune_stale: bool, restore_deleted: bool)
         prune_stale,
         restore_deleted,
         merge,
+        only: false,
     }
 }
 
@@ -832,6 +833,7 @@ fn update_adds_language_with_only_gitignore_fragment() {
         prune_stale: false,
         restore_deleted: false,
         merge: false,
+        only: false,
     };
     run_update(&update, v2.path(), V2_SHA, REPO_URL).unwrap();
 
@@ -958,6 +960,7 @@ fn fresh_mcp_flag_rejected_when_stem_only_exists_under_language_dir() {
         prune_stale: false,
         restore_deleted: false,
         merge: false,
+        only: false,
     };
 
     let err = run_update(&update, v2.path(), V2_SHA, REPO_URL)
@@ -1120,6 +1123,7 @@ fn update_with_drop_mcp_excludes_default_contributor() {
         prune_stale: false,
         restore_deleted: false,
         merge: false,
+        only: false,
     };
     run_update(&update, v2.path(), V2_SHA, REPO_URL).unwrap();
 
@@ -1197,6 +1201,7 @@ fn update_mcp_flag_undrops_previously_dropped_default_contributor() {
         prune_stale: false,
         restore_deleted: false,
         merge: false,
+        only: false,
     };
     run_update(&update, v2.path(), V2_SHA, REPO_URL).unwrap();
 
@@ -1437,5 +1442,174 @@ fn sticky_default_contributor_preserved_when_relocated_to_root() {
     assert!(
         resolved_mcp.contains(&"widget".to_string()),
         "snapshot must still pin widget after move-fallback resolved it at root, got {resolved_mcp:?}"
+    );
+}
+
+// ── --only flag: add without syncing template ──────────────────────────
+
+#[test]
+fn only_adds_mcp_without_syncing_template_changes() {
+    // Simulates `--only` by passing the lockfile's SHA with the original
+    // template content.  The new --mcp should land in .mcp.json but
+    // CLAUDE.md and other files must stay at v1 content.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    let v1 = build_scaffold("v1 ts rules\n");
+    v1.with_named_mcps(&[("extra", r#"{"extra": {"url": "e1"}}"#)]);
+    setup_and_lock(&v1, V1_SHA);
+
+    let claude_md_before = fs::read_to_string("CLAUDE.md").unwrap();
+    assert!(claude_md_before.contains("v1 ts rules"));
+
+    // --only: same scaffold (v1), same SHA, just adding --mcp extra.
+    let update = UpdateArgs {
+        setup: SetupArgs {
+            mcp: vec!["extra".into()],
+            ..Default::default()
+        },
+        prune_stale: false,
+        restore_deleted: false,
+        merge: false,
+        only: false,
+    };
+    run_update(&update, v1.path(), V1_SHA, REPO_URL).unwrap();
+
+    // MCP was added.
+    let mcp_post = fs::read_to_string(".mcp.json").unwrap();
+    assert!(
+        mcp_post.contains("\"extra\""),
+        "extra MCP must be present: {mcp_post}"
+    );
+
+    // CLAUDE.md still has v1 content (template wasn't synced).
+    let claude_md_after = fs::read_to_string("CLAUDE.md").unwrap();
+    assert!(
+        claude_md_after.contains("v1 ts rules"),
+        "CLAUDE.md must still have v1 rules under --only, got:\n{claude_md_after}"
+    );
+
+    // SHA stays at V1 (pinned).
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert_eq!(lock.template_sha, V1_SHA);
+    assert!(lock.original_command.mcp.contains(&"extra".to_string()));
+}
+
+#[test]
+fn only_adds_hooks_without_syncing_template_changes() {
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    let v1 = build_scaffold("v1 ts rules\n");
+    v1.with_named_hooks(&[(
+        "notify",
+        r#"{"PreToolUse": [{"type":"command","command":"echo notify"}]}"#,
+    )]);
+    setup_and_lock(&v1, V1_SHA);
+
+    let claude_md_before = fs::read_to_string("CLAUDE.md").unwrap();
+    assert!(claude_md_before.contains("v1 ts rules"));
+
+    let update = UpdateArgs {
+        setup: SetupArgs {
+            hooks: vec!["notify".into()],
+            ..Default::default()
+        },
+        prune_stale: false,
+        restore_deleted: false,
+        merge: false,
+        only: false,
+    };
+    run_update(&update, v1.path(), V1_SHA, REPO_URL).unwrap();
+
+    let settings = fs::read_to_string(".claude/settings.local.json").unwrap();
+    assert!(
+        settings.contains("echo notify"),
+        "hook must be added: {settings}"
+    );
+
+    // Template content unchanged.
+    let claude_md_after = fs::read_to_string("CLAUDE.md").unwrap();
+    assert!(
+        claude_md_after.contains("v1 ts rules"),
+        "CLAUDE.md must stay at v1 under --only: {claude_md_after}"
+    );
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert_eq!(lock.template_sha, V1_SHA);
+}
+
+#[test]
+fn normal_update_syncs_template_changes_unlike_only() {
+    // Contrast test: a normal update (not --only) at V2_SHA DOES pick up
+    // template changes.  This proves the --only simulation above is meaningful.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    {
+        let v1 = build_scaffold("v1 ts rules\n");
+        v1.with_named_mcps(&[("extra", r#"{"extra": {"url": "e1"}}"#)]);
+        setup_and_lock(&v1, V1_SHA);
+    }
+
+    let claude_md_before = fs::read_to_string("CLAUDE.md").unwrap();
+    assert!(claude_md_before.contains("v1 ts rules"));
+
+    // Normal update: v2 scaffold with changed rules, at V2_SHA.
+    let v2 = build_scaffold("v2 ts rules\n");
+    v2.with_named_mcps(&[("extra", r#"{"extra": {"url": "e2"}}"#)]);
+
+    let update = UpdateArgs {
+        setup: SetupArgs {
+            mcp: vec!["extra".into()],
+            ..Default::default()
+        },
+        prune_stale: false,
+        restore_deleted: false,
+        merge: false,
+        only: false,
+    };
+    run_update(&update, v2.path(), V2_SHA, REPO_URL).unwrap();
+
+    // MCP landed.
+    let mcp_post = fs::read_to_string(".mcp.json").unwrap();
+    assert!(mcp_post.contains("\"extra\""));
+
+    // CLAUDE.md picked up v2 rules — proving a non-pinned update syncs.
+    let claude_md_after = fs::read_to_string("CLAUDE.md").unwrap();
+    assert!(
+        claude_md_after.contains("v2 ts rules"),
+        "normal update must sync template changes, got:\n{claude_md_after}"
+    );
+
+    let lock = Lockfile::load(Path::new(".")).unwrap().unwrap();
+    assert_eq!(lock.template_sha, V2_SHA);
+}
+
+#[test]
+fn only_with_no_additive_args_is_noop() {
+    // --only with no new args: SHA unchanged, command unchanged → fast path.
+    let workdir = TempDir::new().unwrap();
+    let _g = CwdGuard::new(workdir.path());
+
+    let v1 = build_scaffold("v1 ts rules\n");
+    setup_and_lock(&v1, V1_SHA);
+
+    let claude_md_before = fs::read("CLAUDE.md").unwrap();
+    let lock_before = fs::read(LOCKFILE_NAME).unwrap();
+
+    let update = UpdateArgs {
+        setup: SetupArgs::default(),
+        prune_stale: false,
+        restore_deleted: false,
+        merge: false,
+        only: false,
+    };
+    run_update(&update, v1.path(), V1_SHA, REPO_URL).unwrap();
+
+    assert_eq!(fs::read("CLAUDE.md").unwrap(), claude_md_before);
+    assert_eq!(
+        fs::read(LOCKFILE_NAME).unwrap(),
+        lock_before,
+        "lockfile must not be re-written on no-op --only"
     );
 }

@@ -164,6 +164,12 @@ pub struct UpdateArgs {
     /// Use Claude to interactively merge conflicts instead of keeping your version
     #[arg(long, conflicts_with = "force")]
     pub merge: bool,
+
+    /// Apply only the additions from this invocation — don't sync upstream
+    /// template changes.  Pins the template at the lockfile's SHA so only
+    /// the flags you pass (e.g. --mcp, --hooks) have an effect.
+    #[arg(long)]
+    pub only: bool,
 }
 
 // ── Lockfile ─────────────────────────────────────────────────────────────
@@ -1271,6 +1277,27 @@ pub fn clone_repo(repo_url: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+/// Fetch and checkout a specific commit in an already-cloned template directory.
+/// Used by `--only` to pin the template at the lockfile's SHA.
+pub fn checkout_sha(clone_dir: &Path, sha: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args(["-C", &clone_dir.to_string_lossy(), "fetch", "origin", sha])
+        .status()
+        .context("Failed to fetch pinned SHA")?;
+    if !status.success() {
+        bail!("git fetch for --only pinned SHA {sha} failed — the commit may have been force-pushed away");
+    }
+
+    let status = Command::new("git")
+        .args(["-C", &clone_dir.to_string_lossy(), "checkout", sha])
+        .status()
+        .context("Failed to checkout pinned SHA")?;
+    if !status.success() {
+        bail!("git checkout {sha} failed");
+    }
+    Ok(())
 }
 
 /// Append template gitignore fragments to `<dest_dir>/.gitignore`, skipping any

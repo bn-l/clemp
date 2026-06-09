@@ -39,6 +39,7 @@
   - `--restore-deleted` — re-copy files the user removed from disk
   - `--merge` — use Claude to interactively merge conflicts (default: keep user's version)
   - `--force` — overwrite conflicts with template version (mutually exclusive with `--merge`)
+  - `--only` — apply only the additions from this invocation without syncing upstream template changes; pins the clone to the lockfile's SHA via `checkout_sha`
 - `clemp list [CATEGORY]` — list available template files. `CATEGORY` is one of `mcp`, `hooks`, `commands`, `githooks`, `clarg`, `gitignore`, `languages`; omit for all categories with headers.
 - `-v` / `--version` — top-level, prints version from `Cargo.toml`
 
